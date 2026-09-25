@@ -1,0 +1,202 @@
+# Dataset recipe for the pool level. One file = one repeatable dataset: same file + same seed = same images.
+# Run from the UE Output Log (Cmd), with /Game/volume/water_volume open:
+#
+#   py "<project>/SegPipeline/sdg/sdg.py" setup  pool   (once, then Ctrl+S)
+#   py "<project>/SegPipeline/sdg/sdg.py" render pool --quick 20   (smoke test)
+#   py "<project>/SegPipeline/sdg/sdg.py" render pool
+#
+# <project> = the folder holding MyProject.uproject. Relative paths below start at the SegPipeline folder.
+
+name = "pool_v1"                        # names the sequences, the raw folder and the dataset folder
+map = "/Game/volume/water_volume"
+seed = 1
+
+[output]
+raw_dir = "../Saved/SDG/raw"            # MRQ EXRs, deleted as soon as they are converted
+dataset_dir = "../Saved/SDG/datasets"   # -> ../Saved/SDG/datasets/pool_v1/{seg.yaml, pose.yaml, previews/...}
+val_fraction = 0.1
+min_area = 60                           # px: smaller visible parts get no label
+epsilon = 1.0                           # px: polygon simplification
+empty_keep = 0.15                       # share of frames with nothing labelled kept as background images
+previews = 30                           # overlay images per stage - look at them before training
+
+[render]
+resolution = [1280, 720]                # 960x540 renders ~1.8x faster if small targets allow it
+executor = "pie"                        # "pie" renders inside this editor; "process" = separate game process
+fps = 30                                # world time per frame (water surface, caustic animation)
+anti_aliasing = "tsr"
+warmup_frames = 32                      # rendered but not saved at the start of each stage
+# cvars = { "r.Lumen.ScreenProbeGather.Temporal.MaxFramesAccumulated" = 4 }   # any console variables
+
+[post]
+python = ""                             # "" = $SDG_PYTHON, else SegPipeline/.venv, else ~/seg-train/.venv
+workers = 6
+train = ""                              # "seg", "pose" or "both": start training when the dataset is done
+train_args = "--epochs 150"
+open_trainer = true                     # when a full render is done, the SDG app opens its Train page with this dataset
+
+# ------------------------------------------------------------------------------------------ classes
+[classes]                               # YOLO ids follow list order: append new classes at the END
+seg = ["ambulance", "blood", "fire", "firetruck", "bin_o", "bin_x"]   # torpedo ids match the real Torpedo_RS set
+pose = ["torpedo_board", "bin"]
+
+[[props]]
+name = "torpedo_board"
+type = "texture_regions"                # drawings printed on a texture: one mask per class
+texture = "/Game/base_link/Textures/f9f56d69-75f4-4541-ab38-9738eeac5871"
+regions = { blood = "props/torpedo_board/T_Mask_blood.png", ambulance = "props/torpedo_board/T_Mask_ambulance.png", fire = "props/torpedo_board/T_Mask_fire.png", firetruck = "props/torpedo_board/T_Mask_firetruck.png" }
+pose_class = "torpedo_board"
+keypoints = "face4"                     # 4 corners of the board face (thinnest axis). Corners on the back
+                                        # in the previews? use "face4:-x" / "face4:-y" instead.
+
+[[props]]
+name = "bin_o"
+type = "material_slots"                 # only the yellow O marking is the seg class
+static_mesh = "/Game/Props/SM_Bin_O*"
+slots = { "*Yellow*" = "bin_o" }
+pose_class = "bin"
+keypoints = "top4"                      # 4 corners of the bin's top face
+
+[[props]]
+name = "bin_x"
+type = "material_slots"
+static_mesh = "/Game/Props/SM_Bin_X*"
+slots = { "*Yellow*" = "bin_x" }
+pose_class = "bin"
+keypoints = "top4"
+
+# ------------------------------------------------------------------------------------------ camera
+[camera]
+fov = [68, 92]                          # horizontal degrees - centre this on your AUV camera's real FOV
+distance = [120, 700]                   # cm from the object being looked at
+elevation = [2, 30]                     # deg above the object (keeps the camera off the floor)
+aim_jitter = 10                         # deg the object may sit off-centre
+roll = [-6, 6]
+speed = [8, 30]                         # random_path: cm per frame
+# Where the camera may be, in world cm. SET THIS once: fly the viewport to two opposite corners of the
+# water (inside the walls, below the surface) and run  py ".../sdg.py" where  at each.
+# volume = { min = [2481, 2480, 433], max = [-2470, -2446, 66] }
+
+# ------------------------------------------------------------------------------------------ randomization
+# One block per variable instead of 4-5 Blueprint nodes. Value specs:
+#   [a, b] uniform | { normal = [mean, std], clip = [lo, hi] } | { choice = [...], weights = [...] } | constant
+#   colours: { hsv = { h = [..], s = [..], v = [..] } } | { rgb = [[r0,r1],[g0,g1],[b0,b1]] } | { kelvin = [k0, k1] }
+# every = N   new value every N images (default 1)        smooth = true   blend between them (moving scenes)
+# mode = "multiply" / "add"   relative to what is set in the level (float/vector/postprocess)
+# Stages can override any of these by name (see [[stages]]).
+
+[[randomize]]
+name = "sun_intensity"
+actor = "*"                             # every actor with a directional light (SunSky and any other)
+component = "DirectionalLightComponent"
+property = "Intensity"
+mode = "multiply"
+value = [0.25, 1.6]
+
+[[randomize]]
+name = "sun_direction"                  # moves where the caustics fall
+actor = "*"
+component = "DirectionalLightComponent"
+type = "transform"                      # offsets from the light's current rotation
+rotation = { pitch = [-15, 15], yaw = [-180, 180] }
+
+[[randomize]]
+name = "sun_color"
+actor = "*"
+component = "DirectionalLightComponent"
+property = "LightColor"
+type = "color"
+value = { hsv = { h = [0.0, 1.0], s = [0.0, 0.25], v = [1.0, 1.0] } }
+
+[[randomize]]
+name = "caustics_scale"                 # size of the light-function caustic pattern
+actor = "*"
+component = "DirectionalLightComponent"
+property = "LightFunctionScale"
+type = "vector"
+mode = "multiply"
+value = [0.6, 1.7]
+
+[[randomize]]
+name = "sky_intensity"
+actor = "*"
+component = "SkyLightComponent"
+property = "Intensity"
+mode = "multiply"
+value = [0.4, 1.5]
+
+[[randomize]]
+name = "exposure"
+postprocess = "AutoExposureBias"        # C++ names of Post Process Volume settings
+value = [-1.0, 1.0]
+
+[[randomize]]
+name = "white_balance"
+postprocess = "WhiteTemp"
+value = [4800, 8500]
+
+[[randomize]]
+name = "film_grain"
+postprocess = "FilmGrainIntensity"
+value = [0.0, 0.3]
+
+[[randomize]]
+name = "chromatic_aberration"
+postprocess = "SceneFringeIntensity"
+value = [0.0, 1.5]
+
+[[randomize]]
+name = "bins_layout"
+actor = "SM_Bin_*"
+type = "transform"
+per_target = true                       # each bin gets its own offset
+location = { x = [-80, 80], y = [-80, 80] }
+rotation = { yaw = [-180, 180] }
+every = 25                              # new layout every 25 images
+
+# Material parameters: add them to your material through a Material Parameter Collection, e.g.
+# [[randomize]]
+# name = "caustics_strength"
+# mpc = "/Game/SDG/MPC_SDG"             # setup creates it and adds the parameter; use it in the light function
+# param = "CausticsStrength"
+# value = [0.4, 1.8]
+#
+# Mesh material parameter on a slot, or swap the material:
+# [[randomize]]
+# name = "floor_tint"
+# actor = "Floor"
+# material_slot = 0
+# param = "Tint"
+# value = { hsv = { h = [0, 1], s = [0, 0.3], v = [0.6, 1.0] } }
+
+[water_fog]                             # extra underwater haze over your water look (M_SDG_WaterFog)
+enabled = true
+density = [0.0003, 0.004]               # 1/cm
+color = { hsv = { h = [0.42, 0.58], s = [0.35, 0.85], v = [0.04, 0.25] } }
+min_visibility = 0.15                   # objects dimmed below 15% by the haze get no label
+
+# ------------------------------------------------------------------------------------------ stages
+# Stages render back to back into ONE dataset, each with its own camera mode, count and overrides.
+
+[[stages]]
+name = "wander"                         # smooth random flight: every frame is an image (fastest)
+frames = 1500
+camera = { mode = "random_path" }
+
+[[stages]]
+name = "snap"                           # independent random views; each rendered twice, second kept
+frames = 800
+camera = { mode = "teleport", hold = 2 }
+
+[[stages]]
+name = "dim_far"
+frames = 700
+camera = { mode = "random_path", distance = [300, 1100] }
+override = { sun_intensity = [0.05, 0.3], exposure = [-2.0, 0.0] }
+
+# Planned camera path + random everything else: animate a CineCamera in a Level Sequence (camera cut
+# track + transform keys), then point a stage at it. The path is resampled onto SDG_Camera.
+# [[stages]]
+# name = "orbit_board"
+# camera = { mode = "sequence", sequence = "/Game/SDG/Paths/LS_OrbitBoard", sample_fps = 10, repeat = 3, jitter_pos = 6, jitter_rot = 2, fov = [70, 90] }
+# override = { sun_intensity = { value = [0.5, 1.2], every = 30, smooth = true } }

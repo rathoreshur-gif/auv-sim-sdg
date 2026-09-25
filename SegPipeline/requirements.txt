@@ -1,0 +1,13 @@
+# Python 3.12 (3.11+ needed for tomllib), Windows. From the SegPipeline folder:
+#   py -3.12 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+# The extra index provides the CUDA 12.8 PyTorch build. Remove that line for a CPU-only install.
+# Versions are the ones this pipeline was tested with.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0
+torchvision==0.26.0
+ultralytics==8.4.160
+albumentations==2.0.8
+numpy==2.5.2
+opencv-python==5.0.0.93
+PyYAML==6.0.3

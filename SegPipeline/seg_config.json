@@ -1,0 +1,33 @@
+{
+  "content_path": "/Game/SegPipeline",
+  "stencil_step": 10,
+  "capture": { "width": 1280, "height": 720 },
+
+  "classes": ["blood", "ambulance", "fire", "firetruck", "bin_o", "bin_x"],
+
+  "props": [
+    {
+      "name": "torpedo_board",
+      "type": "texture_regions",
+      "texture": "/Game/base_link/Textures/f9f56d69-75f4-4541-ab38-9738eeac5871",
+      "regions": {
+        "blood":     "props/torpedo_board/T_Mask_blood.png",
+        "ambulance": "props/torpedo_board/T_Mask_ambulance.png",
+        "fire":      "props/torpedo_board/T_Mask_fire.png",
+        "firetruck": "props/torpedo_board/T_Mask_firetruck.png"
+      }
+    },
+    {
+      "name": "bin_o",
+      "type": "material_slots",
+      "static_mesh": "/Game/Props/SM_Bin_O*",
+      "slots": { "*Yellow*": "bin_o" }
+    },
+    {
+      "name": "bin_x",
+      "type": "material_slots",
+      "static_mesh": "/Game/Props/SM_Bin_X*",
+      "slots": { "*Yellow*": "bin_x" }
+    }
+  ]
+}
