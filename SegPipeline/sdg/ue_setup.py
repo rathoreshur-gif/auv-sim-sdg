@@ -6,6 +6,9 @@ One-time scene setup (re-run after changing props in the config or in the level)
   - "texture_regions" / "material_slots" props get invisible copies that only write custom
     depth: one per class region (as before) plus a "body" copy for the whole object, which gives
     the pose bounding box. The body copy is pushed 0.5 cm away from the camera, so regions win on top of it.
+  - texture_regions props with `images`: each image is imported next to the masks with a material
+    instance that shows it instead of the texture, plus one cutout material per class mask of every
+    image. The "image" randomizer (ue_bake) swaps both on the same frames.
   - M_SDG_Labels: post-process material rendered by MRQ as an extra pass.
     R = stencil id where that surface is the visible one (0 elsewhere), G = scene depth in cm
   - SDG_Camera (CineCamera, filmback matched to the output aspect ratio, no depth of field) and
@@ -184,9 +187,12 @@ def build_constant_material(name, opacity, depth_offset=0.0):
 _cutout = []
 
 
-def get_cutout(default_mask):
+def get_cutout(default_mask, rebuild=True):
     """Masked material with a "Mask" texture parameter. Built lazily: it needs a default
-    texture on the parameter or it fails to compile (and then tags the whole surface)."""
+    texture on the parameter or it fails to compile (and then tags the whole surface).
+    rebuild=False (bake) reuses the one setup made."""
+    if not _cutout and not rebuild and eal.does_asset_exist(f"{CONTENT}/M_SDG_Cutout"):
+        _cutout.append(unreal.load_asset(f"{CONTENT}/M_SDG_Cutout"))
     if not _cutout:
         m = get_or_create(CONTENT, "M_SDG_Cutout", unreal.Material, unreal.MaterialFactoryNew())
         masked_unlit(m)
@@ -321,34 +327,161 @@ def clear_previous(actors):
         log(f"removed {removed} old segmentation copies")
 
 
-def import_region_masks(prop, folder):
-    tasks = []
-    for cls, rel in prop["regions"].items():
+def import_textures(prop, jobs, rebuild):
+    """jobs: [(png path, folder, asset name)] -> (texture assets, names imported now). rebuild=False only
+    imports what is missing (bake); True re-imports everything (setup: picks up edited PNGs)."""
+    tasks, fresh = [], set()
+    for src, folder, name in jobs:
+        if not rebuild and eal.does_asset_exist(f"{folder}/{name}"):
+            continue
+        fresh.add(name)
         t = unreal.AssetImportTask()
-        t.filename = sc.resolve_path(rel)
+        t.filename = src
         t.destination_path = folder
-        t.destination_name = f"T_SDGMask_{prop['name']}_{cls}"
+        t.destination_name = name
         t.automated = True
         t.replace_existing = True
         t.save = False
         tasks.append(t)
-    at.import_asset_tasks(tasks)
-    out = {}
-    for cls in prop["regions"]:
-        tex = unreal.load_asset(f"{folder}/T_SDGMask_{prop['name']}_{cls}")
+    if tasks:
+        at.import_asset_tasks(tasks)
+    out = []
+    for src, folder, name in jobs:
+        tex = unreal.load_asset(f"{folder}/{name}")
         if tex is None:
-            raise RuntimeError(f"prop '{prop['name']}': import failed for {prop['regions'][cls]}")
-        tex.set_editor_property("srgb", False)
-        tex.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
-        eal.save_loaded_asset(tex)
-        mi = get_or_create(folder, f"MI_SDG_{prop['name']}_{cls}", unreal.MaterialInstanceConstant,
+            raise RuntimeError(f"prop '{prop['name']}': import failed for {src}")
+        out.append(tex)
+    return out, fresh
+
+
+def region_materials(prop, folder, idx, regions, rebuild):
+    """Cutout material instance per class mask of one image: {class: MI}.
+    Image 0 (the texture in the level) keeps the asset names it always had."""
+    sfx = "" if idx == 0 else f"_img{idx}"
+    classes = list(regions)
+    names = [f"T_SDGMask_{prop['name']}_{cls}{sfx}" for cls in classes]
+    texs, fresh = import_textures(prop, [(regions[c], folder, n) for c, n in zip(classes, names)], rebuild)
+    out = {}
+    for cls, name, tex in zip(classes, names, texs):
+        if name in fresh:
+            tex.set_editor_property("srgb", False)
+            tex.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
+            eal.save_loaded_asset(tex)
+        path = f"{folder}/MI_SDG_{prop['name']}_{cls}{sfx}"
+        if not rebuild and name not in fresh and eal.does_asset_exist(path):
+            out[cls] = unreal.load_asset(path)
+            continue
+        mi = get_or_create(folder, f"MI_SDG_{prop['name']}_{cls}{sfx}", unreal.MaterialInstanceConstant,
                            unreal.MaterialInstanceConstantFactoryNew())
-        mel.set_material_instance_parent(mi, get_cutout(tex))
+        mel.set_material_instance_parent(mi, get_cutout(tex, rebuild))
         mel.set_material_instance_texture_parameter_value(mi, "Mask", tex)
         mel.update_material_instance(mi)
         eal.save_loaded_asset(mi)
         out[cls] = mi
     return out
+
+
+TEXTURE_SETTINGS = ("srgb", "compression_settings", "lod_group", "mip_gen_settings", "filter",
+                    "address_x", "address_y", "never_stream")
+
+
+def image_textures(prop, folder, tex, images, rebuild):
+    """The prop's other images as textures with the same settings as its texture: [tex, image 1, ...]."""
+    jobs = [(img["image"], folder, f"T_SDGImage_{prop['name']}_{i}") for i, img in enumerate(images) if i > 0]
+    texs, fresh = import_textures(prop, jobs, rebuild)
+    for (src, _, name), t in zip(jobs, texs):
+        if name not in fresh:
+            continue
+        for p in TEXTURE_SETTINGS:
+            try:
+                t.set_editor_property(p, tex.get_editor_property(p))
+            except Exception:
+                pass
+        eal.save_loaded_asset(t)
+        try:
+            a, b = (tex.blueprint_get_size_x(), tex.blueprint_get_size_y()), (t.blueprint_get_size_x(), t.blueprint_get_size_y())
+            if a != b:
+                warn(f"prop '{prop['name']}': {os.path.basename(src)} is {b[0]}x{b[1]} but the texture is {a[0]}x{a[1]} "
+                     f"- the image must have the same layout (UVs) as the texture")
+        except Exception:
+            pass
+    return [tex] + texs
+
+
+def texture_params(mat, tex):
+    """Names of mat's texture parameters that currently hold tex."""
+    try:
+        names = mel.get_texture_parameter_names(mat)
+    except Exception:
+        return []
+    out = []
+    for n in names:
+        try:
+            if isinstance(mat, unreal.MaterialInstance):
+                v = mel.get_material_instance_texture_parameter_value(mat, n)
+            else:
+                v = mel.get_material_default_texture_parameter_value(mat, n)
+        except Exception:
+            continue
+        if v == tex:
+            out.append(n)
+    return out
+
+
+def image_material(prop, folder, mat, tex, idx, image, rebuild):
+    """Instance of `mat` that shows image `idx` wherever mat shows the prop's texture."""
+    name = f"MI_SDGImage_{prop['name']}_{idx}_{mat.get_name()}"
+    if not rebuild and eal.does_asset_exist(f"{folder}/{name}"):
+        return unreal.load_asset(f"{folder}/{name}")
+    params = texture_params(mat, tex)
+    if not params:
+        raise RuntimeError(
+            f"prop '{prop['name']}': {mat.get_path_name()} uses {tex.get_name()} without a texture parameter, so "
+            f"the image can't be swapped. In that material right-click the Texture Sample -> Convert to Parameter, "
+            f"save, and run setup again.")
+    mi = get_or_create(folder, name, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+    mel.set_material_instance_parent(mi, mat)
+    for p in params:
+        mel.set_material_instance_texture_parameter_value(mi, p, image)
+    mel.update_material_instance(mi)
+    eal.save_loaded_asset(mi)
+    return mi
+
+
+def textured_slots(actor, tex):
+    """{static mesh component name: [slot indices whose material shows tex]}. Label copies are
+    duplicates of their owner, so the same names and indices apply to them."""
+    return {c.get_name(): [i for i in range(c.get_num_materials()) if material_uses(c.get_material(i), tex)]
+            for c in actor.get_components_by_class(unreal.StaticMeshComponent)}
+
+
+def prepare_images(prop, owners, seg, rebuild):
+    """Everything a texture_regions prop needs, per image number (0 = its texture as in the level,
+    1.. = its `images`):
+        labels     {class: [cutout MI or None (class not on that image)] per image}   -> label copies
+        materials  {path of a material showing the texture: [material per image]}  -> the prop's own meshes
+    rebuild=True (setup) re-imports every PNG; False (bake) only creates what is missing."""
+    folder = f"{CONTENT}/{prop['name']}"
+    tex = unreal.load_asset(prop["texture"])
+    if tex is None:
+        raise RuntimeError(f"prop '{prop['name']}': texture not found {prop['texture']}")
+    images = sc.prop_images(prop, seg)
+    labels = {}
+    for idx, img in enumerate(images):
+        for cls, mi in region_materials(prop, folder, idx, img["regions"], rebuild).items():
+            labels.setdefault(cls, [None] * len(images))[idx] = mi
+    materials = {}
+    if len(images) > 1:
+        textures = image_textures(prop, folder, tex, images, rebuild)
+        for owner in owners:
+            for c in owner.get_components_by_class(unreal.StaticMeshComponent):
+                for i in range(c.get_num_materials()):
+                    mat = c.get_material(i)
+                    if mat is None or mat.get_path_name() in materials or not material_uses(mat, tex):
+                        continue
+                    materials[mat.get_path_name()] = [mat] + [image_material(prop, folder, mat, tex, k, textures[k], rebuild)
+                                                              for k in range(1, len(images))]
+    return {"count": len(images), "texture": tex, "labels": labels, "materials": materials}
 
 
 def setup_props(cfg, alloc):
@@ -365,8 +498,13 @@ def setup_props(cfg, alloc):
             warn(f"prop '{prop['name']}': nothing in this level matched it")
             continue
         kind = prop["type"]
-        regions = import_region_masks(prop, f"{CONTENT}/{prop['name']}") if kind == "texture_regions" else {}
-        tex = unreal.load_asset(prop["texture"]) if kind == "texture_regions" else None
+        regions, tex = {}, None
+        if kind == "texture_regions":
+            prep = prepare_images(prop, owners, cfg["seg_classes"], rebuild=True)
+            regions, tex = prep["labels"], prep["texture"]
+            if prep["count"] > 1:
+                log(f"prop '{prop['name']}': {prep['count']} images (texture + {prep['count'] - 1}), "
+                    f"classes {sorted(regions)}")
         groups = stacked_groups(owners)
         for k, group in enumerate(groups):
             key = f"{prop['name']}#{k}"
@@ -408,11 +546,13 @@ def label_owner(prop, kind, key, owner, regions, tex, take, none_mat, solid, bod
 
     make_copy(owner, key, "__body__", take("__body__", owner), lambda comp, i: body)
     if kind == "texture_regions":
-        used = {c.get_name(): [material_uses(c.get_material(i), tex) for i in range(c.get_num_materials())]
-                for c in owner.get_components_by_class(unreal.StaticMeshComponent)}
-        for cls, mi in regions.items():
+        # one copy per class on ANY of the prop's images; it shows the level texture's mask (image 0),
+        # and the "image" randomizer swaps in the mask of the image being shown
+        used = textured_slots(owner, tex)
+        for cls, per_image in regions.items():
+            mi = per_image[0] or none_mat
             make_copy(owner, key, cls, take(cls, owner),
-                      lambda comp, i, mi=mi: mi if (used.get(comp.get_name(), []) + [False] * 99)[i] else none_mat)
+                      lambda comp, i, mi=mi: mi if i in used.get(comp.get_name(), []) else none_mat)
     else:                                                   # material_slots
         slot_cls = {}
         for c in owner.get_components_by_class(unreal.StaticMeshComponent):

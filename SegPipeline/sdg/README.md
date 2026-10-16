@@ -17,7 +17,8 @@ sdg_common.py       config, seeded sampling, Unreal coordinate math (shared)
 tests/              offline tests: python tests/test_pipeline.py
 ue_listener.py      (UE) bridge for the SDG App (started by Content/Python/init_unreal.py)
 ../app/             the SDG App (below); ../SDG App.bat starts it
-../train/train_yolo.py   train seg or pose with the train_seg.py augmentations
+../train/train_yolo.py   train seg or pose with the recipe in train/recipe.py (--quick, --eval real sets)
+../tools/prop_image.py   another image for a texture_regions prop (see "Printed images")
 ```
 
 ## The SDG App (no command line)
@@ -28,7 +29,7 @@ Double-click **`SegPipeline/SDG App.bat`**. It opens a window with three pages:
 |---|---|
 | **1 Recipe** | Create / edit configs with forms: classes, props, camera (the volume corners come from the Unreal viewport with one click), randomizers (switch each on/off, templates for lights, post-process, materials, props), haze, stages. Every change is checked like the pipeline does; Save writes `configs/<name>.toml` (the first save keeps your hand-written file as `<name>.toml.orig`). |
 | **2 Render** | Run setup (and save the level), a quick test and the full render in the open editor. Live progress per stage, images/s, time left, the preview images and the pipeline's log lines. |
-| **3 Train** | Pick a dataset (folder or zip), YOLO version and size, epochs / image size / batch ..., augmentation strength (Off / Light / Medium / Strong, the underwater effects, or each value), then start training (the yolo-training repo, in its own window). Follow every run's mAP and loss, run `analyse_model.py` or score a model on real labelled images. |
+| **3 Train** | **Quick train** a dataset: `train_yolo.py --quick` (30 epochs, fast recipe), then scored on the real labelled datasets from Settings. Or set up a full training: YOLO version and size, epochs / image size / batch ..., augmentation strength (Off / Light / Medium / Strong, the underwater effects, or each value), in the yolo-training repo. Follows every run in `SegPipeline/runs` (quick trains, `post.train`) and the repo's `runs/`: mAP and loss, real-image scores per dataset with the prediction images, `analyse_model.py`, Evaluate on real images. |
 
 The app drives the editor through `ue_listener.py`, which starts by itself when the editor opens
 (`Content/Python/init_unreal.py`). In an editor that was already open, run once in the Output Log:
@@ -61,10 +62,12 @@ With `post.train = ""` (off), a full run also packs `Saved/SDG/datasets/<name>_y
 YOLO-seg dataset (images, labels, a `data.yaml` without absolute paths) to share. Unzip anywhere and train
 with `data=<folder>/data.yaml`. Re-pack by hand: `post.bat --zip` in the raw run folder.
 
-Train (or set `post.train = "seg"` / `"both"` to start automatically instead of zipping):
+Train in the SDG app (Train page, **Quick train**), or set `post.train = "quick"` (30 epochs) / `"seg"` /
+`"both"` to start right after the render instead of zipping. Segmentation runs started this way are scored
+on the real labelled datasets set in the app's Settings when they finish (`<run>/real_eval/`). By hand:
 
 ```
-..\.venv\Scripts\python.exe ..\train\train_yolo.py --task seg  --data <dataset>\seg.yaml
+..\.venv\Scripts\python.exe ..\train\train_yolo.py --task seg  --data <dataset>\seg.yaml --quick --eval <real>\data.yaml
 ..\.venv\Scripts\python.exe ..\train\train_yolo.py --task pose --data <dataset>\pose.yaml
 ```
 
@@ -136,7 +139,8 @@ per_target = false              # true: each matched actor gets its own value
 `FilmGrainIntensity`, `SceneFringeIntensity`, `VignetteIntensity`, `SceneColorTint`),
 `mpc` (`mpc` + `param`: material parameter collection, for any material you wire it into),
 `material_param` (`material_slot` + `param` on a mesh's material), `material` (`material_slot`,
-`value = { choice = [material paths] }` swaps materials).
+`value = { choice = [material paths] }` swaps materials), `image` (`prop`: which of a texture_regions
+prop's images it shows, see below).
 
 Values: `[a, b]` uniform, `{ normal = [mean, std], clip = [lo, hi] }`, `{ loguniform = [a, b] }`,
 `{ choice = [...], weights = [...] }`, `{ randint = [a, b] }`, a constant, or colours
@@ -149,6 +153,36 @@ Stage overrides: `override = { sun_intensity = [0.05, 0.3] }` or a table with `v
 `MPC_SDG` (setup creates it and adds every `param` named in `mpc` randomizers) to the material,
 then randomize it with an `mpc` block. Outside a render the editor shows the parameter's default:
 1 / white, or `default = ...` in the block (setup writes it into MPC_SDG).
+
+**Printed images** (e.g. the torpedo board layouts): list the prop's other images in its `images`,
+one folder per image with its masks next to it, and add an `image` randomizer:
+
+```toml
+[[props]]
+name = "torpedo_board"
+type = "texture_regions"
+texture = "/Game/..."                   # image 0: what the level shows, masks in `regions`
+regions = { blood = "props/torpedo_board/T_Mask_blood.png", ... }
+images = ["props/torpedo_board/images/task4_ver1/texture.png", "props/torpedo_board/images/task4_ver2/texture.png"]
+
+[[randomize]]
+name = "board_image"
+type = "image"
+prop = "torpedo_board"
+value = { choice = [0, 1, 2], weights = [1, 2, 1] }   # optional; left out = every image equally often
+every = 60
+```
+
+Make a new image's folder with `tools/prop_image.py` (copies the image, cuts the same see-through holes as
+the texture into its red rings with `--holes-like`, writes `T_Mask_<class>.png` + `masks_preview.png`;
+classes in reading order, like `make_texture_masks.ps1`). The image must have the texture's size and
+layout (same UVs). `setup` imports the images and makes a material instance per image (the texture has to
+reach the material through a texture parameter, as imported glTF materials do) and a cutout per mask;
+the label copies swap masks on the same frames as the picture, so labels always match what is printed.
+A class that is missing from an image simply gets no label while that image is shown. Re-run `setup`
+after changing `images` (a `bake` also creates missing assets, e.g. when `setup` ran with another config).
+In flying stages keep `every` large (TSR carries the old picture over for a frame or two after a swap);
+teleport stages with `hold >= 2` can use `every = 1` (the swap lands on the frame that is not kept).
 
 **`[water_fog]`** adds a randomized haze over the whole image (colour + density per frame, applied
 after your water material). Objects dimmed below `min_visibility` by the haze get no label, so

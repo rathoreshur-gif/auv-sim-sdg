@@ -4,7 +4,8 @@ SDG App - a local app for the synthetic data pipeline.
   Recipe  create and edit dataset configs (sdg/configs/*.toml) with forms instead of a text editor
   Render  run setup, a quick test and the full render in the open Unreal Editor; watch progress,
           previews and the log
-  Train   pick a dataset, model and augmentation, start training (yolo-training repo) and follow runs
+  Train   quick-train a dataset with the pipeline's recipe (train/train_yolo.py --quick, then scored on
+          real images), or configure a full training (yolo-training repo); follow both kinds of runs
 
 Start it with "SDG App.bat" (or: <venv python> app/server.py). It serves http://127.0.0.1:8765
 to this PC only and opens it in an app window. Unreal commands go through sdg/ue_listener.py, which
@@ -18,9 +19,11 @@ import argparse
 import copy
 import csv
 import ctypes
+import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -49,6 +52,9 @@ CONFIG_DIR = os.environ.get("SDG_APP_CONFIGS", os.path.join(SDG_DIR, "configs"))
 BRIDGE = os.environ.get("SDG_BRIDGE_DIR", os.path.join(SDG_DIR, ".bridge"))
 STATE_DIR = os.environ.get("SDG_APP_STATE", os.path.join(APP_DIR, "state"))
 STATIC = os.path.join(APP_DIR, "static")
+RUNS = os.environ.get("SDG_RUNS_DIR", os.path.join(ROOT, "runs"))   # the pipeline's training runs (quick trains, post.train)
+TRAIN_SCRIPT = os.environ.get("SDG_TRAIN_SCRIPT", os.path.join(ROOT, "train", "train_yolo.py"))   # (tests swap these)
+EVAL_SCRIPT = os.environ.get("SDG_EVAL_SCRIPT", os.path.join(ROOT, "train", "eval_real.py"))
 LISTENER = os.path.join(SDG_DIR, "ue_listener.py").replace("\\", "/")
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
@@ -67,14 +73,22 @@ def default_settings():
     home = os.path.expanduser("~")
     repo = os.path.join(home, "Downloads", "yolo-training")
     py = os.path.join(repo, ".venv", "Scripts", "python.exe")
-    real = os.path.join(home, "Downloads", "Torpedo_RS.v1i.yolov11", "data.yaml")
     return {
         "trainer_repo": repo.replace("\\", "/") if os.path.isdir(repo) else "",
         "trainer_python": (py if os.path.isfile(py) else sys.executable).replace("\\", "/"),
-        "real_data": real.replace("\\", "/") if os.path.isfile(real) else "",
+        "real_sets": sc.default_real_sets(),          # real labelled datasets (data.yaml or Roboflow .zip)
+        "real_unstretch": "1280 720",                 # Roboflow squares -> camera aspect before scoring
+        "real_data": "",                              # older single real dataset (read once into real_sets)
         "editor_log": _editor_log(),
         "recent_datasets": [],
     }
+
+
+def _path_list(v):
+    """Settings/requests give real datasets as a list or as text with one path per line."""
+    if isinstance(v, str):
+        v = v.replace(";", "\n").splitlines()
+    return [norm(str(p).strip().strip('"')) for p in (v or []) if str(p).strip()]
 
 
 class Settings:
@@ -84,7 +98,10 @@ class Settings:
         self.data = default_settings()
         try:
             with open(self.path, encoding="utf-8") as f:
-                self.data.update(json.load(f))
+                saved = json.load(f)
+            if "real_sets" not in saved:                  # saved by an older app: defaults + its single real_data
+                saved["real_sets"] = sc.merge_real_sets(self.data["real_sets"], saved.get("real_data"))
+            self.data.update(saved)
         except (OSError, ValueError):
             pass
 
@@ -92,6 +109,8 @@ class Settings:
         return self.data.get(k, default)
 
     def update(self, **kw):
+        if "real_sets" in kw:
+            kw["real_sets"] = _path_list(kw["real_sets"])
         with self.lock:
             self.data.update({k: v for k, v in kw.items() if k in default_settings()})
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -156,7 +175,7 @@ H = {   # path -> hint. doc: tooltip | enum | enum_from | example (value used by
 
     "post.python": {"doc": "Python with numpy + opencv that builds the dataset. Empty = $SDG_PYTHON, else SegPipeline/.venv, else ~/seg-train/.venv.", "advanced": True},
     "post.workers": {"doc": "Parallel workers converting frames to images + labels."},
-    "post.train": {"enum": ["", "seg", "pose", "both"], "doc": "Empty = pack a shareable zip after a full render. seg/pose/both = start the pipeline's own training instead."},
+    "post.train": {"enum": list(sc.POST_TRAIN), "doc": "Empty = pack a shareable zip after a full render. seg/pose/both = start the pipeline's own training instead (seg runs are scored on the real datasets from Settings). quick = seg, 30 epochs, scored on the real datasets: for trying recipes."},
     "post.train_args": {"doc": "Extra arguments for the pipeline's own training (post.train).", "advanced": True},
     "post.open_trainer": {"doc": "When a full render is done, open this app's Train page with the new dataset."},
 
@@ -199,6 +218,7 @@ H = {   # path -> hint. doc: tooltip | enum | enum_from | example (value used by
     "props[].static_mesh": {"doc": "Static mesh asset path pattern, e.g. /Game/Props/SM_Bin_O*."},
     "props[].texture": {"doc": "texture_regions: the texture asset with the drawings (/Game/...)."},
     "props[].regions": {"doc": "texture_regions: class = mask PNG (paths relative to SegPipeline/).", "example": {}},
+    "props[].images": {"example": [], "doc": "texture_regions: other images the prop can show (same size and layout as the texture), one folder each with its T_Mask_<class>.png - make them with tools/prop_image.py. An \"image\" randomizer picks one per image. Re-run setup after changing this."},
     "props[].slots": {"doc": "material_slots: \"*SlotOrMaterialPattern*\" = class.", "example": {"*Yellow*": ""}},
     "props[].class": {"enum_from": "classes.seg", "doc": "actor: the class of the whole object."},
     "props[].body_class": {"enum_from": "classes.seg", "doc": "Optional class for the rest of the object."},
@@ -216,7 +236,7 @@ H = {   # path -> hint. doc: tooltip | enum | enum_from | example (value used by
     "randomize[].mpc": {"example": sc.SDG_MPC, "doc": "Material Parameter Collection asset (wire its parameter into your material)."},
     "randomize[].param": {"doc": "Parameter name (MPC or material)."},
     "randomize[].material_slot": {"example": 0, "doc": "Material slot index on the mesh."},
-    "randomize[].value": {"example": [0.5, 1.5], "doc": "[min, max] = uniform. Also { normal = [mean, std], clip = [lo, hi] }, { choice = [...] }, colours { hsv = {...} } / { kelvin = [k0, k1] }."},
+    "randomize[].value": {"example": [0.5, 1.5], "doc": "[min, max] = uniform. Also { normal = [mean, std], clip = [lo, hi] }, { choice = [...] }, colours { hsv = {...} } / { kelvin = [k0, k1] }. image: image numbers, e.g. { choice = [0, 1, 2], weights = [1, 2, 1] } (left out = all equally)."},
     "randomize[].mode": {"enum": ["set", "add", "multiply"], "doc": "set = use the value; multiply / add = relative to what is set in the level."},
     "randomize[].every": {"example": 1, "doc": "New value every N images (lighting: 10-20 keeps Lumen from ghosting)."},
     "randomize[].smooth": {"example": True, "doc": "Blend between values (flying stages)."},
@@ -227,6 +247,7 @@ H = {   # path -> hint. doc: tooltip | enum | enum_from | example (value used by
     "randomize[].offset": {"example": False, "doc": "transform: false = absolute values instead of offsets."},
     "randomize[].probability": {"example": 0.5, "doc": "visible: chance the actor is shown (0 = always hidden)."},
     "randomize[].default": {"example": 0.0, "doc": "mpc: the value the editor shows outside a render."},
+    "randomize[].prop": {"enum_from": "props.names", "doc": "image: the texture_regions prop whose printed image is swapped (its masks swap with it)."},
 
     "stages[].name": {"doc": "Stage name (image file prefix)."},
     "stages[].frames": {"example": 1000, "doc": "Number of images in this stage."},
@@ -243,10 +264,10 @@ OBJECT_KEYS = {  # suggested keys for free-form objects
 }
 
 ITEM_FIELDS = {
-    "props": ["name", "type", "actor_label", "actor_tag", "static_mesh", "texture", "regions", "slots", "class",
+    "props": ["name", "type", "actor_label", "actor_tag", "static_mesh", "texture", "regions", "images", "slots", "class",
               "body_class", "pose_class", "keypoints"],
     "randomize": ["name", "enabled", "type", "actor", "tag", "component", "property", "postprocess", "mpc", "param",
-                  "material_slot", "value", "mode", "every", "smooth", "per_target", "location", "rotation", "scale",
+                  "material_slot", "prop", "value", "mode", "every", "smooth", "per_target", "location", "rotation", "scale",
                   "offset", "probability", "default"],
     "stages": ["name", "frames", "camera", "override", "disable"],
 }
@@ -285,6 +306,8 @@ TEMPLATES = {
         {"label": "Swap material", "doc": "pick one of several materials",
          "item": {"name": "floor_material", "actor": "Floor", "type": "material", "material_slot": 0,
                   "value": {"choice": ["/Game/..."]}}},
+        {"label": "Printed image", "doc": "which of a prop's images it shows (e.g. torpedo board layouts); labels follow",
+         "item": {"name": "board_image", "type": "image", "prop": "torpedo_board", "every": 60}},
     ],
     "stages": [
         {"label": "Smooth flight", "doc": "random_path: every frame is an image (fastest)",
@@ -750,7 +773,7 @@ PRESETS = {
                           "shear": 2, "perspective": 0.0005, "fliplr": 0.5, "flipud": 0, "mosaic": 1, "mixup": 0,
                           "copy_paste": 0.1},
                "albumentations": "none"},
-    "strong": {"label": "Strong", "doc": "synthetic -> real: the Unreal recipe (unreal_config.yaml)",
+    "strong": {"label": "Strong", "doc": "synthetic -> real: the pipeline's recipe (train/recipe.py, unreal_config.yaml)",
                "values": {"hsv_h": 0.08, "hsv_s": 0.9, "hsv_v": 0.6, "degrees": 15, "translate": 0.2, "scale": 0.7,
                           "shear": 4, "perspective": 0.0008, "fliplr": 0.5, "flipud": 0, "mosaic": 1, "mixup": 0.15,
                           "copy_paste": 0.3},
@@ -769,18 +792,41 @@ SIZES = [
     {"id": "x", "label": "x", "doc": "extra large: slowest, most accurate"},
 ]
 TRAIN_DEFAULTS = {"version": "yolo11", "size": "s", "epochs": 150, "imgsz": 640, "batch": 16, "patience": 40,
-                  "device": "auto", "workers": 6, "cache": "disk", "cos_lr": True, "close_mosaic": 15, "time": None,
+                  "device": "auto", "workers": 12, "cache": "disk", "cos_lr": True, "close_mosaic": 15, "time": None,
                   "freeze": 0, "preset": "strong"}
+QUICK = {"epochs": 30, "patience": 10, "workers": 12}     # train/recipe.py QUICK, shown in the app
+
+
+def sdg_python(settings):
+    """Python for the pipeline's own training / evaluation: $SDG_PYTHON, SegPipeline/.venv, ~/seg-train/.venv,
+    else the yolo-training Python."""
+    py = sc.default_python() or settings.get("trainer_python") or ""
+    return norm(py) if py and os.path.isfile(py) else ""
+
+
+def real_sets(settings):
+    return [p for p in _path_list(settings.get("real_sets") or []) if os.path.exists(p)]
+
+
+def real_set_label(path):
+    """Torpedo_RS.v1i.yolov11/data.yaml -> Torpedo_RS.v1i.yolov11, Tropedo.v1i.yolov11.zip -> Tropedo.v1i.yolov11"""
+    p = norm(path)
+    if p.lower().endswith(".zip"):
+        return os.path.basename(p)[:-4]
+    return os.path.basename(os.path.dirname(p)) if p.lower().endswith((".yaml", ".yml")) else os.path.basename(p)
 
 
 def train_options(settings):
     repo = settings.get("trainer_repo") or ""
     return {"aug": [dict(zip(("key", "label", "doc", "min", "max", "step"), a)) for a in AUG], "presets": PRESETS,
-            "versions": VERSIONS, "sizes": SIZES, "defaults": TRAIN_DEFAULTS,
+            "versions": VERSIONS, "sizes": SIZES, "defaults": TRAIN_DEFAULTS, "quick": QUICK,
             "repo": repo, "repo_ok": os.path.isfile(os.path.join(repo, "train.py")),
             "python": settings.get("trainer_python"), "python_ok": os.path.isfile(settings.get("trainer_python") or ""),
+            "sdg_python": sdg_python(settings), "sdg_python_ok": bool(sdg_python(settings)),
             "unreal_config": os.path.isfile(os.path.join(repo, "config", "unreal_config.yaml")),
-            "real_data": settings.get("real_data", "")}
+            "real_sets": [{"path": p, "label": real_set_label(p)} for p in real_sets(settings)],
+            "real_unstretch": settings.get("real_unstretch", "1280 720"),
+            "run_roots": [{"key": k, "dir": d, "label": lbl} for k, d, lbl in run_roots(settings)]}
 
 
 def _yaml_scalar(v):
@@ -823,8 +869,8 @@ def training_config(req):
     for key, _label, _doc, lo, hi, _step in AUG:
         aug[key] = _num(req.get("aug", {}).get(key, PRESETS["strong"]["values"][key]), float, lo, hi, key)
     alb = req.get("albumentations", "none")
-    if alb not in ("none", "underwater"):
-        raise ApiError("albumentations: none or underwater")
+    if alb not in ("none", "underwater", "underwater_fog"):
+        raise ApiError("albumentations: none, underwater or underwater_fog")
     aug["erasing"] = 0.4
     aug["albumentations"] = alb
     time_h = req.get("time")
@@ -833,7 +879,7 @@ def training_config(req):
         "batch": _num(req.get("batch", 16), int, -1, 1024, "batch"),
         "imgsz": _num(req.get("imgsz", 640), int, 32, 4096, "imgsz"),
         "device": str(req.get("device", "auto")),
-        "workers": _num(req.get("workers", 6), int, 0, 64, "workers"),
+        "workers": _num(req.get("workers", TRAIN_DEFAULTS["workers"]), int, 0, 64, "workers"),
         "patience": _num(req.get("patience", 40), int, 0, 5000, "patience"),
         "optimizer": "auto", "lr0": 0.01, "lrf": 0.01, "momentum": 0.937, "weight_decay": 0.0005,
         "warmup_epochs": 3, "cos_lr": bool(req.get("cos_lr", True)),
@@ -881,9 +927,9 @@ def _save_registry(reg):
     write_json(_registry_path(), reg[-200:])
 
 
-def _launch_console(title, cmd, cwd, status_file=None):
+def _launch_console(title, cmd, cwd, status_file=None, script_dir=None):
     """Run cmd in its own console window that stays open at the end. Returns the process."""
-    gui_dir = os.path.join(cwd, "runs", "_gui")
+    gui_dir = script_dir or (os.path.dirname(status_file) if status_file else os.path.join(cwd, "runs", "_gui"))
     os.makedirs(gui_dir, exist_ok=True)
     bat = os.path.join(gui_dir, f"{re.sub(r'[^A-Za-z0-9_-]', '_', title)}-{time.strftime('%Y%m%d-%H%M%S')}.bat")
     lines = ["@echo off", f"title {title}", f'cd /d "{cwd}"']
@@ -896,11 +942,17 @@ def _launch_console(title, cmd, cwd, status_file=None):
     hidden = bool(os.environ.get("SDG_APP_HIDDEN"))     # tests: no window, no "press a key"
     if not hidden:
         lines += ["echo.", "echo Finished (exit code %RC%). Press a key to close this window.", "pause >nul"]
+    if os.name != "nt":                                   # development / tests on Linux: same steps as a shell script
+        sh = bat[:-4] + ".sh"
+        body = [f'cd "{cwd}"'] + ([f'echo running > "{status_file}"'] if status_file else [])
+        body += [" ".join(json.dumps(str(a)) for a in cmd), "RC=$?"]
+        body += [f'echo "exit $RC" > "{status_file}"'] if status_file else []
+        with open(sh, "w", encoding="utf-8") as f:
+            f.write("\n".join(body) + "\n")
+        return subprocess.Popen(["sh", sh], cwd=cwd), sh
     with open(bat, "w", encoding="utf-8") as f:
         f.write("\r\n".join(lines) + "\r\n")
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NO_WINDOW if hidden else subprocess.CREATE_NEW_CONSOLE
+    flags = subprocess.CREATE_NO_WINDOW if hidden else subprocess.CREATE_NEW_CONSOLE
     return subprocess.Popen(["cmd", "/c", bat], cwd=cwd, creationflags=flags), bat
 
 
@@ -933,12 +985,76 @@ def start_training(req, settings):
     proc, bat = _launch_console(f"Training {name}", cmd, repo, status)
     with _reg_lock:
         reg = registry()
-        reg.append({"name": name, "model": norm(model_path), "dataset": norm(dataset), "config": norm(cfg_path),
+        reg.append({"name": name, "root": "app", "model": norm(model_path), "dataset": norm(dataset), "config": norm(cfg_path),
                     "started": time.time(), "pid": proc.pid, "status_file": norm(status), "bat": norm(bat),
                     "run_dir": None, "epochs": cfg["train"]["epochs"]})
         _save_registry(reg)
     settings.remember_dataset(norm(dataset))
-    return {"ok": True, "model": norm(model_path), "config": norm(cfg_path),
+    return {"ok": True, "model": norm(model_path), "config": norm(cfg_path), "id": f"app:{name}",
+            "command": " ".join(_quote(a) for a in cmd)}
+
+
+def sdg_data_yaml(path):
+    """Dataset (folder, its pose/ folder or its shareable zip) -> (yaml for train_yolo.py, task)."""
+    p = norm(path)
+    if p.lower().endswith(".zip"):
+        stem = os.path.basename(p)[:-4]
+        folder = os.path.join(os.path.dirname(p), stem[:-len("_yolo_seg")] if stem.endswith("_yolo_seg") else stem)
+        if not os.path.isdir(folder):
+            raise ApiError("Quick train uses the dataset folder, not the zip - pick the folder "
+                           f"({norm(folder)}) or unzip it there")
+        p = norm(folder)
+    if os.path.basename(p) == "pose" and os.path.isfile(os.path.join(os.path.dirname(p), "pose.yaml")):
+        return norm(os.path.join(os.path.dirname(p), "pose.yaml")), "pose"
+    for f, task in (("seg.yaml", "seg"), ("data.yaml", "seg"), ("pose.yaml", "pose")):
+        if os.path.isfile(os.path.join(p, f)):
+            return norm(os.path.join(p, f)), task
+    raise ApiError(f"no seg.yaml / data.yaml in {p}")
+
+
+def start_quick(req, settings):
+    """Quick train: train/train_yolo.py --quick (fast recipe, 30 epochs) on the dataset, then score best.pt on
+    the real datasets from Settings. Runs in its own window; the run folder is SegPipeline/runs/<name>."""
+    py = sdg_python(settings)
+    if not py:
+        raise ApiError("no Python with ultralytics found for the pipeline (SegPipeline/.venv, ~/seg-train/.venv "
+                       "or $SDG_PYTHON) - or set the training Python in Settings")
+    dataset = (req.get("dataset") or "").strip()
+    if not dataset or not os.path.exists(dataset):
+        raise ApiError("choose a dataset")
+    data_yaml, task = sdg_data_yaml(dataset)
+    info = dataset_info(os.path.dirname(data_yaml) if task == "seg" else os.path.join(os.path.dirname(data_yaml), "pose"))
+    if task == "seg" and info.get("task") == "detect":
+        raise ApiError("Quick train is for segmentation or pose datasets (this one has box labels)")
+    runs = RUNS
+    base = (req.get("model_name") or "").strip() or re.sub(r"[^A-Za-z0-9_-]+", "_", info["name"]) + "_quick"
+    if not NAME_RE.match(base):
+        raise ApiError("model name: letters, digits, _ and - only")
+    name, i = base, 2
+    while os.path.exists(os.path.join(runs, name)):
+        name, i = f"{base}_{i}", i + 1
+    version, size = req.get("version") or "yolo11", req.get("size") or "s"
+    if version not in {v["id"] for v in VERSIONS} or size not in "nsmlx" or not size:
+        raise ApiError("choose a model version and size")
+    weights = (req.get("base") or "").strip() or f"{version}{size}-{task}.pt"
+    if req.get("base") and not os.path.isfile(weights):
+        raise ApiError(f"start-from model not found: {weights}")
+    cmd = [py, norm(TRAIN_SCRIPT), "--task", task, "--data", data_yaml, "--quick",
+           "--name", name, "--project", norm(runs), "--model", weights, "--workers", str(QUICK["workers"])]
+    sets = real_sets(settings)
+    if task == "seg" and sets:
+        cmd += ["--eval", *sets, "--unstretch", *(str(settings.get("real_unstretch") or "none").split() or ["none"])]
+    os.makedirs(runs, exist_ok=True)
+    status = os.path.join(runs, "_gui", f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.status")
+    proc, bat = _launch_console(f"Quick train {name}", cmd, ROOT, status)
+    with _reg_lock:
+        reg = registry()
+        reg.append({"name": name, "root": "sdg", "model": None, "dataset": norm(dataset), "config": None,
+                    "started": time.time(), "pid": proc.pid, "status_file": norm(status), "bat": norm(bat),
+                    "run_dir": norm(os.path.join(runs, name)), "epochs": QUICK["epochs"], "quick": True})
+        _save_registry(reg)
+    settings.remember_dataset(norm(dataset))
+    return {"ok": True, "id": f"sdg:{name}", "name": name, "real_sets": len(sets) if task == "seg" else 0,
             "command": " ".join(_quote(a) for a in cmd)}
 
 
@@ -961,8 +1077,14 @@ def process_alive(pid):
     return bool(ok) and code.value == 259                   # STILL_ACTIVE
 
 
-def _runs_dir(settings):
-    return os.path.join(settings.get("trainer_repo") or "", "runs")
+def run_roots(settings):
+    """Where training runs live: (key, folder, label). "sdg" = SegPipeline/runs (quick trains, post.train),
+    "app" = the yolo-training repo's runs (full trainings started here)."""
+    roots = [("sdg", norm(RUNS), "pipeline")]
+    repo = settings.get("trainer_repo") or ""
+    if repo:
+        roots.append(("app", norm(os.path.join(repo, "runs")), "yolo-training"))
+    return roots
 
 
 def _resolve_run_dir(entry, runs_dir):
@@ -974,6 +1096,18 @@ def _resolve_run_dir(entry, runs_dir):
         if e.is_dir() and pat.match(e.name) and e.stat().st_ctime >= entry["started"] - 2:
             cands.append((e.stat().st_ctime, norm(e.path)))
     return min(cands)[1] if cands else None
+
+
+def run_dir_of(settings, run_id):
+    """"sdg:name" / "app:name" (or a bare name: first root that has it) -> the run folder."""
+    run_id = run_id or ""
+    key, _, name = run_id.rpartition(":")
+    if not NAME_RE.match(name):
+        raise ApiError("bad run name")
+    for k, d, _ in run_roots(settings):
+        if (not key or k == key) and os.path.isdir(os.path.join(d, name)):
+            return k, norm(os.path.join(d, name))
+    raise ApiError(f"run not found: {run_id}")
 
 
 def _read_results(run_dir):
@@ -1025,97 +1159,151 @@ def _args(run_dir):
         return _yaml_load(f.read())
 
 
+def real_results(run_dir):
+    """Scores on real labelled images saved in a run folder: <run>/real_eval/<set>/metrics.json (eval_real.py),
+    also <run>/real_eval/metrics.json and <run>/eval_real/<set>/ from earlier versions."""
+    out = []
+    for folder in ("real_eval", "eval_real"):
+        base = os.path.join(run_dir, folder)
+        if not os.path.isdir(base):
+            continue
+        cands = [base] + [e.path for e in sorted(os.scandir(base), key=lambda e: e.name.lower()) if e.is_dir()]
+        for d in cands:
+            m = read_json(os.path.join(d, "metrics.json"))
+            if not isinstance(m, dict) or "all" not in m:
+                continue
+            ov_dir = os.path.join(d, "overlays")
+            overlays = sorted(f for f in os.listdir(ov_dir) if f.lower().endswith(IMG_EXT))[:24] if os.path.isdir(ov_dir) else []
+            rel = os.path.relpath(d, run_dir).replace("\\", "/")
+            name = m.get("name") or (os.path.basename(d) if d != base else real_set_label(m.get("data", "")))
+            inst = m.get("instances")
+            if inst is None and m.get("per_class"):
+                inst = sum(int(c.get("instances", 0)) for c in m["per_class"].values())
+            out.append({"name": name, "dir": norm(d), "images": m.get("images"), "instances": inst,
+                        "splits": m.get("splits"), "unstretch": m.get("unstretch"), "all": m["all"],
+                        "per_class": m.get("per_class", {}), "false50": m.get("false_detections_conf50"),
+                        "ignored": m.get("ignored_dataset_classes", []),
+                        "mtime": os.path.getmtime(os.path.join(d, "metrics.json")),
+                        "overlays": [f"{rel}/overlays/{f}" for f in overlays]})
+    return out
+
+
 def list_runs(settings):
-    runs_dir = _runs_dir(settings)
-    if not os.path.isdir(runs_dir):
-        return []
     with _reg_lock:
         reg = registry()
         changed = False
         by_dir = {}
+        roots = {k: d for k, d, _ in run_roots(settings)}
         for entry in reg:
-            rd = _resolve_run_dir(entry, runs_dir)
+            rd = _resolve_run_dir(entry, roots.get(entry.get("root", "app"), ""))
             if rd and rd != entry.get("run_dir"):
                 entry["run_dir"], changed = rd, True
             if rd:
-                by_dir[rd] = entry
+                by_dir[norm(rd)] = entry
         if changed:
             _save_registry(reg)
     out = []
-    for e in os.scandir(runs_dir):
-        if not e.is_dir() or e.name.startswith("_"):
+    for key, runs_dir, label in run_roots(settings):
+        if not os.path.isdir(runs_dir):
             continue
-        rd = norm(e.path)
-        head, data = _read_results(rd)
-        args = _args(rd)
-        entry = by_dir.get(rd)
-        epochs = args.get("epochs") or (entry or {}).get("epochs")
-        status = _guess_status(rd, head, data, epochs)
-        if entry:
-            st = _read_text(entry["status_file"]) or ""
-            if st.startswith("exit"):
-                status = "finished" if st.strip() == "exit 0" else "failed"
-            elif process_alive(entry.get("pid")):
-                status = "running"
-            elif st == "running":
-                status = "stopped"
-        out.append({"name": e.name, "dir": rd, "status": status, "epoch": int(data[-1][0]) if data else 0,
-                    "epochs": epochs, "best": _best_metric(head, data), "task": args.get("task"),
-                    "mtime": os.path.getmtime(os.path.join(rd, "results.csv")) if data else e.stat().st_mtime,
-                    "model": (entry or {}).get("model"), "dataset": (entry or {}).get("dataset"),
-                    "elapsed": data[-1][head.index("time")] if data and "time" in head else None})
+        for e in os.scandir(runs_dir):
+            if not e.is_dir() or e.name.startswith("_"):
+                continue
+            rd = norm(e.path)
+            head, data = _read_results(rd)
+            args = _args(rd)
+            entry = by_dir.get(rd)
+            if not data and not args and not entry:
+                continue                                   # not a training run
+            epochs = args.get("epochs") or (entry or {}).get("epochs")
+            status = _guess_status(rd, head, data, epochs)
+            if entry:
+                st = (_read_text(entry["status_file"]) or "").strip()
+                if st.startswith("exit"):
+                    status = "finished" if st == "exit 0" else "failed"
+                elif process_alive(entry.get("pid")):
+                    status = "running"
+                elif st == "running":
+                    status = "stopped"
+            real = real_results(rd)
+            mtime = max([os.path.getmtime(os.path.join(rd, "results.csv")) if data else e.stat().st_mtime]
+                        + [r["mtime"] for r in real])
+            out.append({"id": f"{key}:{e.name}", "name": e.name, "root": key, "source": label, "dir": rd,
+                        "status": status, "epoch": int(data[-1][0]) if data else 0,
+                        "epochs": epochs, "best": _best_metric(head, data), "task": args.get("task"),
+                        "mtime": mtime, "model": (entry or {}).get("model"), "dataset": (entry or {}).get("dataset"),
+                        "quick": bool((entry or {}).get("quick")),
+                        "real": [{"name": r["name"], "mAP50": r["all"]["mAP50"]} for r in real],
+                        "elapsed": data[-1][head.index("time")] if data and "time" in head else None})
     out.sort(key=lambda r: r["mtime"], reverse=True)
     return out
 
 
-def run_detail(settings, name):
-    if not NAME_RE.match(name or ""):
-        raise ApiError("bad run name")
-    rd = norm(os.path.join(_runs_dir(settings), name))
-    if not os.path.isdir(rd):
-        raise ApiError(f"run not found: {name}")
+def run_detail(settings, run_id):
+    key, rd = run_dir_of(settings, run_id)
     head, data = _read_results(rd)
-    run = next((r for r in list_runs(settings) if r["dir"] == rd), {"name": name, "dir": rd})
+    run = next((r for r in list_runs(settings) if r["dir"] == rd), {"id": f"{key}:{os.path.basename(rd)}",
+                                                                     "name": os.path.basename(rd), "dir": rd})
     args = _args(rd)
-    run.update(columns=head, rows=data, args={k: args.get(k) for k in ("model", "data", "epochs", "imgsz", "batch", "task")},
-               best_pt=norm(os.path.join(rd, "weights", "best.pt")) if os.path.isfile(os.path.join(rd, "weights", "best.pt")) else None,
-               real_eval=os.path.isdir(os.path.join(rd, "real_eval")))
+    best = os.path.join(rd, "weights", "best.pt")
+    run.update(columns=head, rows=data,
+               args={k: args.get(k) for k in ("model", "data", "epochs", "imgsz", "batch", "task", "workers", "patience")},
+               best_pt=norm(best) if os.path.isfile(best) else None,
+               real_eval=real_results(rd),
+               images=[f for f in ("results.png", "train_batch0.jpg", "val_batch0_pred.jpg", "confusion_matrix_normalized.png")
+                       if os.path.isfile(os.path.join(rd, f))])
     return run
 
 
-def model_for_run(settings, name):
-    repo = settings.get("trainer_repo") or ""
+def run_file(settings, run_id, rel):
+    """An image inside a run folder (overlays, plots) for the app to show."""
+    _, rd = run_dir_of(settings, run_id)
+    path = os.path.realpath(os.path.join(rd, rel or ""))
+    if not path.startswith(os.path.realpath(rd) + os.sep) or not path.lower().endswith(IMG_EXT) or not os.path.isfile(path):
+        raise ApiError("not found")
+    return path
+
+
+def model_for_run(settings, run_id):
+    key, rd = run_dir_of(settings, run_id)
     for entry in reversed(registry()):
-        if entry.get("run_dir") and os.path.basename(entry["run_dir"]) == name and os.path.isfile(entry["model"]):
+        if entry.get("run_dir") and norm(entry["run_dir"]) == rd and entry.get("model") and os.path.isfile(entry["model"]):
             return entry["model"]
-    for cand in (os.path.join(repo, name + ".pt"), os.path.join(repo, "runs", name, "weights", "best.pt")):
+    for cand in (os.path.join(rd, "weights", "best.pt"), os.path.join(rd, "weights", "last.pt")):
         if os.path.isfile(cand):
             return norm(cand)
-    raise ApiError(f"no model file for run {name}")
+    raise ApiError(f"no model file (weights/best.pt) in {rd}")
 
 
 def launch_tool(settings, req):
-    repo, py = settings.get("trainer_repo") or "", settings.get("trainer_python") or ""
-    name = req.get("run", "")
-    if not NAME_RE.match(name):
-        raise ApiError("bad run name")
-    model = model_for_run(settings, name)
+    run_id = req.get("run", "")
+    key, rd = run_dir_of(settings, run_id)
+    model = model_for_run(settings, run_id)
+    name = os.path.basename(rd)
     if req.get("tool") == "analyse":
-        cmd = [py, "analyse_model.py", "--model", model]
+        repo, py = settings.get("trainer_repo") or "", settings.get("trainer_python") or ""
+        if not os.path.isfile(os.path.join(repo, "analyse_model.py")):
+            raise ApiError("Analyse needs the yolo-training repo (analyse_model.py) - set it in Settings")
+        cmd = [py, "analyse_model.py", "--model", model, "--out", norm(os.path.join(rd, "analysis"))]
+        cwd = repo
     elif req.get("tool") == "evaluate":
-        data = (req.get("data") or "").strip()
-        if not os.path.isfile(data):
-            raise ApiError("choose the real dataset's data.yaml")
-        script = "evaluate_real.py"
-        if not os.path.isfile(os.path.join(repo, script)):
-            raise ApiError(f"{script} not found in {repo}")
+        data = _path_list(req.get("data") if req.get("data") is not None else settings.get("real_sets"))
+        missing = [d for d in data if not os.path.exists(d)]
+        if not data or missing:
+            raise ApiError("real dataset not found: " + ", ".join(missing) if missing else "add a real dataset (data.yaml or Roboflow .zip)")
+        py = sdg_python(settings)
+        if not py:
+            raise ApiError("no Python with ultralytics found - set the training Python in Settings")
         splits = (req.get("splits") or "valid test").split()
-        cmd = [py, script, "--model", model, "--data", data, "--splits", *splits,
-               "--out", norm(os.path.join(repo, "runs", name, "real_eval"))]
-        settings.update(real_data=norm(data))
+        unstretch = str(req.get("unstretch") if req.get("unstretch") is not None else settings.get("real_unstretch") or "")
+        cmd = [py, norm(EVAL_SCRIPT), "--model", model, "--data", *data,
+               "--splits", *splits, "--unstretch", *(unstretch.split() or ["none"]),
+               "--out", norm(os.path.join(rd, "real_eval"))]
+        cwd = ROOT
+        settings.update(real_sets=data, real_unstretch=unstretch)
     else:
         raise ApiError("unknown tool")
-    _launch_console(f"{req['tool']} {name}", cmd, repo)
+    _launch_console(f"{req['tool']} {name}", cmd, cwd, script_dir=os.path.join(os.path.dirname(rd), "_gui"))
     return {"ok": True, "command": " ".join(_quote(a) for a in cmd)}
 
 
@@ -1141,6 +1329,10 @@ def browse(kind, initial=""):
             elif kind == "model":
                 p = filedialog.askopenfilename(parent=root, initialdir=init or None, title="Choose a model",
                                                filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")])
+            elif kind == "real":
+                p = filedialog.askopenfilename(parent=root, initialdir=init or None,
+                                               title="Choose a real labelled dataset: its data.yaml or the Roboflow .zip",
+                                               filetypes=[("data.yaml or zip", "*.yaml *.yml *.zip"), ("All files", "*.*")])
             elif kind == "python":
                 p = filedialog.askopenfilename(parent=root, initialdir=init or None, title="Choose python.exe",
                                                filetypes=[("Python", "python*.exe"), ("All files", "*.*")])
@@ -1169,13 +1361,64 @@ class ApiError(Exception):
     pass
 
 
+# ============================================================================ app version / restart
+# A running server keeps the Python code it started with; the pages (static/) are read from disk on every
+# request. After an update the pages would talk to an older server, so the server reports the version of
+# its code and whether the files on disk have changed since it started, the pages offer a restart, and
+# starting "SDG App.bat" again replaces a server that runs other code instead of just opening a window.
+CODE_FILES = [os.path.abspath(__file__), os.path.abspath(sc.__file__), os.path.abspath(tomlw.__file__)]
+_version_cache = {}
+
+
+def code_version():
+    """Short hash of the server's Python files as they are on disk now."""
+    key = []
+    for p in CODE_FILES:
+        try:
+            st = os.stat(p)
+            key.append((p, st.st_mtime_ns, st.st_size))
+        except OSError:
+            key.append((p, 0, 0))
+    key = tuple(key)
+    if key not in _version_cache:
+        h = hashlib.sha1()
+        for p, *_ in key:
+            try:
+                with open(p, "rb") as f:
+                    h.update(f.read().replace(b"\r\n", b"\n"))
+            except OSError:
+                pass
+        _version_cache.clear()
+        _version_cache[key] = h.hexdigest()[:12]
+    return _version_cache[key]
+
+
+BOOT_VERSION = code_version()
+PAGE_SEEN = [0.0]                       # last time an open app window polled /api/state
+
+
+def server_info():
+    return {"version": BOOT_VERSION, "stale": code_version() != BOOT_VERSION, "pid": os.getpid()}
+
+
+def restart_app(port):
+    """Start a new copy of the app that replaces this one (see main: --replace) and return."""
+    cmd = [sys.executable, os.path.abspath(__file__), "--no-browser", "--replace", "--port", str(port)]
+    if os.name == "nt":
+        subprocess.Popen(cmd + ["--pause-on-error"], cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        subprocess.Popen(cmd, cwd=ROOT, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+
 class App:
     def __init__(self):
         self.settings = Settings()
 
 
 CT = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-      ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon", ".json": "application/json"}
+      ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+      ".bmp": "image/bmp", ".ico": "image/x-icon", ".json": "application/json"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1252,10 +1495,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "not found"})
             return self._file(os.path.join(STATIC, name))
         if path == "/api/ping":
-            return self._send(200, {"app": "sdg", "pid": os.getpid()})
+            return self._send(200, {"app": "sdg", "pid": os.getpid(), "version": BOOT_VERSION})
         if path == "/api/state":
+            PAGE_SEEN[0] = time.time()
             return self._send(200, {"unreal": unreal_status(), "configs": list_configs(), "settings": a.settings.data,
-                                    "listener": LISTENER, "project": norm(PROJECT_DIR)})
+                                    "listener": LISTENER, "project": norm(PROJECT_DIR), "server": server_info()})
         if path == "/api/schema":
             return self._send(200, schema())
         if path == "/api/config":
@@ -1281,11 +1525,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/train/runs":
             return self._send(200, list_runs(a.settings))
         if path == "/api/train/run":
-            return self._send(200, run_detail(a.settings, q.get("name", "")))
+            return self._send(200, run_detail(a.settings, q.get("id") or q.get("name", "")))
+        if path == "/files/run":
+            try:
+                return self._file(run_file(a.settings, q.get("id", ""), q.get("f", "")), cache=True)
+            except ApiError:
+                return self._send(404, {"error": "not found"})
         return self._send(404, {"error": f"no route {path}"})
 
     def _post(self, path, body):
         a = self.app
+        if path == "/api/quit":                    # a newer copy of the app is taking over the port
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return self._send(200, {"ok": True, "pid": os.getpid()})
+        if path == "/api/restart":
+            restart_app(self.server.server_address[1])
+            return self._send(200, {"ok": True, "pid": os.getpid(), "version": BOOT_VERSION})
         if path == "/api/config/check":
             text, errors, summary = check_config(body.get("raw", {}))
             return self._send(200, {"ok": not errors, "errors": errors, "text": text, "summary": summary})
@@ -1298,6 +1553,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"id": send_unreal(body.get("command", ""), body.get("args", []))})
         if path == "/api/train/start":
             return self._send(200, start_training(body, a.settings))
+        if path == "/api/train/quick":
+            return self._send(200, start_quick(body, a.settings))
         if path == "/api/train/tool":
             return self._send(200, launch_tool(a.settings, body))
         if path == "/api/settings":
@@ -1342,12 +1599,81 @@ def open_window(url):
         webbrowser.open(url)
 
 
-def _ours(port):
+def _ping(port, timeout=2):
+    """The app answering on this port: {"app": "sdg", "pid", "version"} (no version: an app from before
+    versions existed), or None."""
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=2) as r:
-            return json.load(r).get("app") == "sdg"
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=timeout) as r:
+            info = json.load(r)
+            return info if info.get("app") == "sdg" else None
     except Exception:
+        return None
+
+
+def _ours(port):
+    return _ping(port) is not None
+
+
+def _terminate(pid):
+    """End a process (exit code 0, so its "SDG App.bat" window closes without waiting for a key)."""
+    try:
+        if os.name == "nt":
+            k = ctypes.WinDLL("kernel32", use_last_error=True)      # own instance: typed handles, 64-bit safe
+            k.OpenProcess.restype = ctypes.c_void_p
+            k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            k.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = k.OpenProcess(0x0001, 0, int(pid))              # PROCESS_TERMINATE
+            ok = bool(handle) and bool(k.TerminateProcess(handle, 0))
+            if handle:
+                k.CloseHandle(handle)
+            if not ok:                                               # its window then waits for a key
+                ok = subprocess.run(["taskkill", "/PID", str(int(pid)), "/F"], capture_output=True).returncode == 0
+            return ok
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    except (OSError, ValueError, AttributeError):
         return False
+
+
+def _wait_gone(port, seconds):
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        if _ping(port, timeout=0.5) is None:
+            return True
+        time.sleep(0.2)
+    return _ping(port, timeout=0.5) is None
+
+
+def stop_running(port, info):
+    """Make the app running on this port quit: ask it (/api/quit); an app from before that existed, or one
+    that doesn't stop, is ended by its pid (only the app's own server process: trainings and renders it
+    started run in their own windows and keep going)."""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/quit", data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            asked = r.status == 200
+    except Exception:
+        asked = False
+    if asked and _wait_gone(port, 8):
+        return True
+    pid = info.get("pid")
+    if pid and int(pid) != os.getpid():
+        _terminate(pid)
+    return _wait_gone(port, 8)
+
+
+def _bind(port, seconds=15):
+    """make_server, retrying while the port is still being released by the app that just quit."""
+    t0 = time.time()
+    while True:
+        try:
+            return make_server(port)
+        except OSError:
+            if time.time() - t0 > seconds:
+                raise
+            time.sleep(0.5)
 
 
 def main():
@@ -1356,27 +1682,53 @@ def main():
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--open", default="", help="page to open: recipe, render or train")
     ap.add_argument("--dataset", default="", help="with --open train: preselect this dataset")
+    ap.add_argument("--replace", action="store_true", help="replace an app already running on the port, even the same version")
+    ap.add_argument("--pause-on-error", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    def fail(msg):
+        if args.pause_on_error:
+            print(msg)
+            input("Press Enter to close this window.")
+        sys.exit(msg)
+
+    if os.name == "nt":
+        try:
+            ctypes.windll.kernel32.SetConsoleTitleW("SDG App - close this window to stop the app")
+        except Exception:
+            pass
     frag = args.open if args.open in ("recipe", "render", "train") else ""
     if frag and args.dataset:
         frag += "?dataset=" + quote(norm(os.path.abspath(args.dataset)))
     url = f"http://127.0.0.1:{args.port}/" + (f"#{frag}" if frag else "")
-    if _ours(args.port):
-        print(f"The SDG app is already running - opening {url}")
-        if not args.no_browser:
-            open_window(url)
-        return
+    running = _ping(args.port)
+    if running:
+        if running.get("version") == BOOT_VERSION and not args.replace:
+            print(f"The SDG app is already running - opening {url}")
+            if not args.no_browser:
+                open_window(url)
+            return
+        why = "restarting it" if running.get("version") == BOOT_VERSION else "it runs older code, replacing it"
+        print(f"The SDG app is already running (process {running.get('pid')}): {why}")
+        if not stop_running(args.port, running):
+            fail(f"The running SDG app (process {running.get('pid')}) did not stop: close its window "
+                 f"('SDG App - close this window to stop the app') and start SDG App.bat again.")
     try:
-        server = make_server(args.port)
+        server = _bind(args.port, 15 if running else 0)
     except OSError:
-        sys.exit(f"Port {args.port} is used by another program: start with --port <another number>")
+        fail(f"Port {args.port} is used by another program: start with --port <another number>")
     print(f"SDG app: {url}\n  Close this window to stop the app.")
     if not args.no_browser:
-        threading.Timer(0.6, open_window, [url]).start()
+        if running and not frag:  # the replaced app's window reloads by itself: only open one if none is open
+            threading.Timer(4.5, lambda: None if PAGE_SEEN[0] else open_window(url)).start()
+        else:
+            threading.Timer(0.6, open_window, [url]).start()
     try:
-        server.serve_forever()
+        server.serve_forever()                  # returns when a newer copy asks this one to quit
+        print("A newer copy of the SDG app took over - this window closes.")
     except KeyboardInterrupt:
         pass
+    server.server_close()
 
 
 if __name__ == "__main__":

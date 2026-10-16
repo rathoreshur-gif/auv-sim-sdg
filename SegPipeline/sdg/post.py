@@ -540,7 +540,8 @@ def main():
     train = run["post"].get("train", "")
     zip_path = None
     if run.get("quick"):
-        print(f"[post] --quick run: no " + (f"training (post.train = {train!r})" if train else "zip") + " - that happens after a full render")
+        print("[post] test render (--quick N): no " + (f"training (post.train = {train!r})" if train else "zip")
+              + " - that happens after a full render")
     elif not train:
         progress.write("zipping", stats=summary)
         zip_path = zip_dataset(run)
@@ -585,16 +586,32 @@ def open_trainer(dataset):
     subprocess.Popen([sys.executable, app, "--open", "train", "--dataset", dataset], creationflags=flags)
 
 
-def start_training(run, which):
+def training_commands(run, which, real=None, unstretch=None):
+    """train_yolo.py command lines for post.train = seg | pose | both | quick. Segmentation runs are scored
+    on the real datasets set in the SDG app when they finish (real_eval/ in the run folder)."""
     script = os.path.join(sc.ROOT, "train", "train_yolo.py")
     ds = run["dataset"]
-    tasks = ["seg", "pose"] if which == "both" else [which]
+    quick = which == "quick"
+    tasks = ["seg"] if quick else ["seg", "pose"] if which == "both" else [which]
+    real = sc.real_sets() if real is None else real
+    unstretch = sc.real_unstretch() if unstretch is None else unstretch
+    cmds = []
     for task in tasks:
         if task == "pose" and not run["pose_classes"]:
             continue
         cmd = [sys.executable, script, "--task", task, "--data", os.path.join(ds, f"{task}.yaml"),
-               "--name", f"{run['name']}_{task}"] + run["post"].get("train_args", "").split()
-        print("[post] training:", " ".join(cmd))
+               "--name", f"{run['name']}_{task}" + ("_quick" if quick else "")]
+        # quick = the fixed quick recipe; train_args (e.g. --epochs 150) are for full runs
+        cmd += ["--quick"] if quick else run["post"].get("train_args", "").split()
+        if task == "seg" and real:
+            cmd += ["--eval", *real, "--unstretch", *(unstretch.split() or ["none"])]
+        cmds.append(cmd)
+    return cmds
+
+
+def start_training(run, which):
+    for cmd in training_commands(run, which):
+        print("[post] training:", " ".join(f'"{c}"' if " " in c else c for c in cmd))
         subprocess.run(cmd, check=False)
 
 

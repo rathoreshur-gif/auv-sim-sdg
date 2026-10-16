@@ -48,6 +48,9 @@ regions = { blood = "props/torpedo_board/T_Mask_blood.png", ambulance = "props/t
 pose_class = "torpedo_board"
 keypoints = "face4"                     # 4 corners of the board face (thinnest axis). Corners on the back
                                         # in the previews? use "face4:-x" / "face4:-y" instead.
+# Other images the board can show (the board_image randomizer). One folder each, masks next to the image
+# (tools/prop_image.py). Re-run setup after changing this list.
+images = ["props/torpedo_board/images/task4_ver1/texture.png", "props/torpedo_board/images/task4_ver2/texture.png"]
 
 [[props]]
 name = "bin_o"
@@ -154,6 +157,13 @@ location = { x = [-80, 80], y = [-80, 80] }
 rotation = { yaw = [-180, 180] }
 every = 25                              # new layout every 25 images
 
+[[randomize]]
+name = "board_image"                    # which image is printed on the torpedo board; its masks swap with it
+type = "image"
+prop = "torpedo_board"
+value = { choice = [0, 1, 2], weights = [1, 2, 1] }   # 0 = its texture, 1.. = its images; 0 and 2 share a layout
+every = 60                              # flying stages: a swap every 2 s (TSR carries the old picture over for a frame or two)
+
 # Material parameters: add them to your material through a Material Parameter Collection, e.g.
 # [[randomize]]
 # name = "caustics_strength"
@@ -187,6 +197,7 @@ camera = { mode = "random_path" }
 name = "snap"                           # independent random views; each rendered twice, second kept
 frames = 800
 camera = { mode = "teleport", hold = 2 }
+override = { board_image = { every = 1 } }   # new board image per view (it swaps on the frame that isn't kept)
 
 [[stages]]
 name = "dim_far"

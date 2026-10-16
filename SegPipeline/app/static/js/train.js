@@ -1,5 +1,6 @@
-// Train page: choose a dataset and training settings, start yolo-training, follow the runs.
-import { h, api, btn, icon, iconBtn, toast, confirmDialog, notice, segmented, switchEl, fmtInt, fmtNum, fmtDuration, fmtBytes, timeAgo, lineChart, clone } from './ui.js';
+// Train page: quick-train a dataset with the pipeline's recipe (train/train_yolo.py --quick, then scored on real
+// images), or set up a full training (yolo-training repo); follow both kinds of runs and their real-image scores.
+import { h, api, btn, icon, iconBtn, toast, confirmDialog, modal, notice, segmented, switchEl, fmtInt, fmtNum, fmtDuration, fmtBytes, timeAgo, lineChart, clone } from './ui.js';
 import { G } from './store.js';
 
 let root = null;
@@ -25,7 +26,8 @@ export async function mount(node, params) {
     const zip = datasets.find((d) => d.kind === 'zip');
     T.form.dataset = (zip || datasets[0]).path;
   }
-  if (!T.sel && runs.length) T.sel = (runs.find((r) => r.status === 'running') || runs[0]).name;
+  if (T.sel && !T.sel.includes(':')) T.sel = null;           // (older app version kept a bare name)
+  if (!T.sel && runs.length) T.sel = (runs.find((r) => r.status === 'running') || runs[0]).id;
   build();
   loadInfo();
   if (T.sel) loadDetail();
@@ -46,20 +48,20 @@ function newForm(opts) {
 // ------------------------------------------------------------------ layout
 function build() {
   const o = T.opts;
-  const warn = !o.repo_ok ? notice('bad', 'alert', h('b', {}, 'yolo-training repo not found'),
-    h('span', {}, `Looked in "${o.repo || '(not set)'}". Set its folder in Settings (bottom left).`))
-    : !o.python_ok ? notice('bad', 'alert', h('b', {}, 'Python for training not found'), h('span', {}, 'Set it in Settings.')) : null;
+  const warn = !o.repo_ok ? notice('warn', 'alert', h('b', {}, 'yolo-training repo not found - full trainings need it'),
+    h('span', {}, `Looked in "${o.repo || '(not set)'}". Set its folder in Settings (bottom left). Quick train works without it.`))
+    : !o.python_ok ? notice('warn', 'alert', h('b', {}, 'Python for full trainings not found'), h('span', {}, 'Set it in Settings.')) : null;
   el.left = h('div', { class: 'stack', style: { gap: '16px' } },
-    datasetCard(), modelCard(), trainingCard(), augCard(), startCard());
+    datasetCard(), quickCard(), modelCard(), trainingCard(), augCard(), startCard());
   el.runs = h('div', { class: 'runs' });
   el.detail = h('div', {});
   const right = h('div', { class: 'stack', style: { gap: '16px' } },
     h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('div', { class: 'titles' }, h('h2', {}, 'Training runs'),
-      h('p', {}, `${o.repo}/runs`)), iconBtn('refresh', 'Refresh', refreshRuns)), el.runs),
+      h('p', {}, (o.run_roots || []).map((r) => r.dir).join('  ·  '))), iconBtn('refresh', 'Refresh', refreshRuns)), el.runs),
     el.detail);
   root.replaceChildren(h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('div', { class: 'titles' }, h('h1', {}, 'Train'),
-      h('p', {}, 'Pick a dataset, a model and how much augmentation - training runs in its own window'))),
+      h('p', {}, 'Quick-train a dataset with the pipeline recipe, or set up a full training - training runs in its own window'))),
     warn, h('div', { class: 'train-layout' }, el.left, right)));
   drawRuns();
   updateName();
@@ -148,6 +150,45 @@ function drawInfo() {
 }
 
 function kpi(v, label) { return h('div', { class: 'kpi' }, h('b', {}, v ?? '—'), h('span', {}, label)); }
+
+// ------------------------------------------------------------------ quick train
+function quickCard() {
+  const o = T.opts, q = o.quick || {};
+  const sets = o.real_sets || [];
+  el.quickCmd = h('div', { class: 'cmd-preview hidden' });
+  const oldServer = !o.quick;         // a server started before Quick train existed (the app banner explains)
+  const go = btn('Quick train', quickTrain, { kind: 'primary', icon: 'zap', busy: 'Starting', disabled: oldServer || !o.sdg_python_ok,
+    title: 'train/train_yolo.py --quick on the dataset above, then score it on the real datasets' });
+  return h('section', { class: 'card quick-card' },
+    h('div', { class: 'card-head' }, h('span', { class: 'section-num' }, icon('zap')),
+      h('div', { class: 'titles' }, h('h2', {}, 'Quick train'),
+        h('p', {}, `The dataset above${q.epochs ? `: ${q.epochs} epochs` : ''} with the fast pipeline recipe, then scored on real images`)), go),
+    h('div', { class: 'card-body stack' },
+      h('div', { class: 'kpis' }, kpi(q.epochs, 'epochs'), kpi(q.patience, 'patience'), kpi(q.workers, 'loader workers'),
+        kpi(sets.length || '—', 'real datasets')),
+      oldServer ? notice('warn', 'alert', 'The app server was started before this update: double-click SDG App.bat to restart it.') : null,
+      oldServer ? null : sets.length
+        ? h('p', { class: 'muted small' }, 'Scored on ', h('b', {}, sets.map((x) => x.label).join(', ')),
+          o.real_unstretch ? ` (square images unstretched to ${o.real_unstretch})` : '', '. Change them in Settings.')
+        : notice('warn', 'alert', 'No real datasets set: the model trains but is not scored on real images. Add them in Settings (bottom left).'),
+      h('p', { class: 'muted small' }, 'Strong augmentation without RandomFog (the renders have their own haze), model version and size from "Model" below. For the model you ship, run a full training.'),
+      oldServer || o.sdg_python_ok ? null : notice('bad', 'alert', 'No Python with ultralytics found for the pipeline (SegPipeline/.venv, ~/seg-train/.venv or SDG_PYTHON).'),
+      el.quickCmd));
+}
+
+async function quickTrain() {
+  const f = T.form;
+  if (!f.dataset) { toast('Choose a dataset first', 'bad'); return; }
+  let r;
+  try {
+    r = await api('/api/train/quick', { dataset: f.dataset, version: f.version, size: f.size, base: f.base });
+  } catch (e) { toast(e.message, 'bad', 9000); return; }
+  el.quickCmd.textContent = r.command;
+  el.quickCmd.classList.remove('hidden');
+  toast(`Quick train started in a new window: ${r.name}` + (r.real_sets ? `, then scored on ${r.real_sets} real dataset(s)` : ''), 'ok', 7000);
+  T.sel = r.id;
+  setTimeout(refreshRuns, 2500);
+}
 
 // ------------------------------------------------------------------ 2 model
 function modelCard() {
@@ -289,7 +330,7 @@ function startCard() {
   el.namePath = h('div', { class: 'opt-doc' });
   el.cmd = h('div', { class: 'cmd-preview hidden' });
   const start = btn('Start training', startTraining, { kind: 'primary big', icon: 'play', busy: 'Starting', disabled: !T.opts.repo_ok || !T.opts.python_ok });
-  return card(5, 'Start', 'Training opens in its own window; you can close this app meanwhile',
+  return card(5, 'Start full training', 'With the settings above (yolo-training repo), in its own window; you can close this app meanwhile',
     h('div', { class: 'stack' }, h('label', { class: 'lbl-block' }, 'Model name', el.nameIn), el.namePath,
       h('div', { class: 'row' }, h('span', { class: 'grow' }), start), el.cmd));
 }
@@ -319,7 +360,7 @@ async function startTraining() {
   el.cmd.textContent = r.command;
   el.cmd.classList.remove('hidden');
   toast(`Training started in a new window: ${T.form.model_name}`, 'ok', 6000);
-  T.sel = T.form.model_name;
+  T.sel = r.id || `app:${T.form.model_name}`;
   T.form.nameTouched = false;
   setTimeout(refreshRuns, 2500);
 }
@@ -336,8 +377,9 @@ async function refreshRuns() {
     T.runs = await api('/api/train/runs');
     if (!root) return;
     drawRuns();
-    const sel = T.runs.find((r) => r.name === T.sel) || T.runs.find((r) => r.name.startsWith(T.sel || '\0'));
-    if (sel && (sel.status === 'running' || !T.detail || T.detail.name !== sel.name)) { T.sel = sel.name; loadDetail(); }
+    const sel = T.runs.find((r) => r.id === T.sel) || T.runs.find((r) => r.id.startsWith(T.sel || '\0'));
+    if (sel && (sel.status === 'running' || !T.detail || T.detail.id !== sel.id || T.detail.status !== sel.status
+        || T.detail.mtime !== sel.mtime)) { T.sel = sel.id; loadDetail(); }
   } catch { /* next time */ }
 }
 
@@ -346,12 +388,14 @@ function drawRuns() {
   if (!T.runs.length) { el.runs.replaceChildren(h('div', { class: 'empty small' }, 'No training runs yet.')); return; }
   el.runs.replaceChildren(...T.runs.slice(0, 30).map((r) => {
     const [cls, label] = STATUS[r.status] || ['', r.status];
-    const best = r.best ? `${r.best.kind} mAP50-95 ${r.best.value.toFixed(3)}` : '';
-    const row = h('div', { class: 'run' + (r.name === T.sel ? ' sel' : ''), title: r.dir },
-      h('span', { class: 'dot ' + cls }), h('span', { class: 'n' }, r.name),
-      h('span', { class: 'v' }, r.best ? r.best.value.toFixed(3) : ''),
-      h('span', { class: 'm' }, [label, r.epochs ? `epoch ${r.epoch} / ${r.epochs}` : null, best, timeAgo(r.mtime)].filter(Boolean).join('  ·  ')));
-    row.addEventListener('click', () => { T.sel = r.name; drawRuns(); loadDetail(); });
+    const best = r.best ? `synthetic ${r.best.kind} mAP50-95 ${r.best.value.toFixed(3)}` : '';
+    const real = r.real?.length ? `real mAP50 ${r.real.map((x) => `${x.name} ${x.mAP50.toFixed(3)}`).join(', ')}` : '';
+    const row = h('div', { class: 'run' + (r.id === T.sel ? ' sel' : ''), title: r.dir },
+      h('span', { class: 'dot ' + cls }), h('span', { class: 'n' }, r.name, r.quick ? h('span', { class: 'tag' }, 'quick') : null,
+        h('span', { class: 'tag faint' }, r.source)),
+      h('span', { class: 'v', title: 'best synthetic-val mAP50-95' }, r.best ? r.best.value.toFixed(3) : ''),
+      h('span', { class: 'm' }, [label, r.epochs ? `epoch ${r.epoch} / ${r.epochs}` : null, real, best, timeAgo(r.mtime)].filter(Boolean).join('  ·  ')));
+    row.addEventListener('click', () => { T.sel = r.id; drawRuns(); loadDetail(); });
     return row;
   }));
 }
@@ -359,8 +403,8 @@ function drawRuns() {
 async function loadDetail() {
   if (!T.sel) return;
   try {
-    const d = await api('/api/train/run?name=' + encodeURIComponent(T.sel));
-    if (!root || d.name !== T.sel) return;
+    const d = await api('/api/train/run?id=' + encodeURIComponent(T.sel));
+    if (!root || d.id !== T.sel) return;
     T.detail = d;
     drawDetail();
   } catch (e) { el.detail.replaceChildren(notice('bad', 'alert', e.message)); }
@@ -390,31 +434,94 @@ function drawDetail() {
   const losses = [series(d, trainL, 'var(--chart-2)', 'train loss (total)'), series(d, valL, 'var(--chart-1)', 'val loss (total)')].filter(Boolean);
   const perEpoch = d.elapsed && d.epoch ? d.elapsed / d.epoch : null;
   const eta = d.status === 'running' && perEpoch && d.epochs ? (d.epochs - d.epoch) * perEpoch : null;
-  const dataIn = h('input', { type: 'text', value: T.opts.real_data || '', spellcheck: false, placeholder: 'real dataset data.yaml (e.g. the Roboflow export)' });
-  const splitsIn = h('input', { type: 'text', value: 'valid test', style: { width: '110px' }, title: 'Splits of the real dataset to score' });
+  const real = d.real_eval || [];
+  const realMean = real.length ? real.reduce((a, r) => a + r.all.mAP50, 0) / real.length : null;
   el.detail.replaceChildren(h('section', { class: 'card' },
     h('div', { class: 'card-head' }, h('div', { class: 'titles' }, h('h2', {}, d.name), h('p', {}, d.dir)),
       h('span', { class: 'chip ' + cls }, cls === 'busy' ? h('span', { class: 'spin' }) : null, label)),
     h('div', { class: 'card-body stack', style: { gap: '14px' } },
       h('div', { class: 'kpis' },
         kpi(d.epochs ? `${d.epoch} / ${d.epochs}` : String(d.epoch || 0), 'epochs'),
-        kpi(d.best ? d.best.value.toFixed(3) : '—', d.best ? `best ${d.best.kind} mAP50-95` : 'mAP50-95'),
+        kpi(realMean != null ? realMean.toFixed(3) : '—', real.length > 1 ? 'real mAP50 (mean)' : 'real mAP50'),
+        kpi(d.best ? d.best.value.toFixed(3) : '—', d.best ? `synthetic ${d.best.kind} mAP50-95` : 'mAP50-95'),
         kpi(perEpoch ? fmtDuration(perEpoch) : '—', 'per epoch'),
         kpi(eta ? fmtDuration(eta) : d.elapsed ? fmtDuration(d.elapsed) : '—', eta ? 'left (at most)' : 'training time')),
+      realSection(d),
       h('div', {}, h('h3', { style: { marginBottom: '6px' } }, 'Validation mAP (synthetic val split - optimistic)'), lineChart(metrics, { yMin: 0, yMax: 1, height: 190 })),
       h('div', {}, h('h3', { style: { marginBottom: '6px' } }, 'Loss'), lineChart(losses, { height: 170 })),
+      d.images?.length ? h('div', { class: 'stack', style: { gap: '6px' } }, h('h3', {}, 'Training images and plots'),
+        thumbs(d, d.images)) : null,
       h('div', { class: 'row' },
         btn('Open run folder', () => api('/api/open', { path: d.dir }).catch((e) => toast(e.message, 'bad')), { kind: 'small', icon: 'folder' }),
-        btn('Analyse', () => tool('analyse'), { kind: 'small', icon: 'chart', title: 'Curves, split scores and an overfitting check (analyse_model.py)', busy: 'Starting' })),
-      h('div', { class: 'stack', style: { gap: '6px' } },
-        h('h3', {}, 'Score on real images'),
-        h('p', { class: 'muted small' }, 'The number that matters: mAP on real labelled images (classes are matched by name). Results go to the run folder (real_eval).'),
-        h('div', { class: 'path-input' }, dataIn, btn('Browse', async () => {
-          const r = await api('/api/browse', { kind: 'yaml', initial: dataIn.value });
-          if (r.path) dataIn.value = r.path;
-        }, { kind: 'small', icon: 'folder', busy: '…' })),
-        h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'splits'), splitsIn, h('span', { class: 'grow' }),
-          btn('Evaluate', () => tool('evaluate', { data: dataIn.value.trim(), splits: splitsIn.value }), { kind: 'small', icon: 'target', busy: 'Starting', disabled: !d.best_pt && d.status !== 'finished' }))))));
+        btn('Analyse', () => tool('analyse'), { kind: 'small', icon: 'chart', busy: 'Starting', disabled: !T.opts.repo_ok,
+          title: 'Curves, split scores and an overfitting check (yolo-training analyse_model.py)' })),
+      evaluateSection(d))));
+}
+
+const fileUrl = (d, f) => `/files/run?id=${encodeURIComponent(d.id)}&f=${encodeURIComponent(f)}`;
+
+function thumbs(d, files) {
+  return h('div', { class: 'thumbs' }, files.map((f) => {
+    const img = h('img', { src: fileUrl(d, f), loading: 'lazy', alt: f, title: f.split('/').pop() });
+    img.addEventListener('click', () => modal({ title: f.split('/').pop(), wide: true,
+      body: [h('img', { src: fileUrl(d, f), class: 'full-img', alt: f })], actions: [{ label: 'Close', value: true }] }));
+    return img;
+  }));
+}
+
+function realSection(d) {
+  const real = d.real_eval || [];
+  const head = h('h3', {}, 'Real images (box metrics, human labels)');
+  if (!real.length) {
+    return h('div', { class: 'stack', style: { gap: '6px' } }, head, h('p', { class: 'muted small' },
+      d.status === 'running' && d.quick ? 'This quick run is scored on the real datasets when training ends.'
+        : 'Not scored on real images yet - use Evaluate below.'));
+  }
+  const cols = [['Real set', ''], ['img', 'images scored'], ['inst', 'labelled drawings'], ['P', 'precision'], ['R', 'recall'],
+    ['mAP50', 'box mAP at IoU 0.5'], ['50-95', 'box mAP50-95'], ['false', 'detections at confidence 0.5 or higher that match no label']];
+  const table = h('div', { class: 'table-scroll' }, h('table', { class: 'stage-table' },
+    h('thead', {}, h('tr', {}, cols.map(([c, t], i) => h('th', { class: i ? 'num' : '', title: t }, c)))),
+    h('tbody', {}, real.map((r) => h('tr', {},
+      h('td', { title: r.dir }, r.name), h('td', { class: 'num' }, fmtInt(r.images)), h('td', { class: 'num' }, fmtInt(r.instances)),
+      h('td', { class: 'num' }, r.all.P.toFixed(3)), h('td', { class: 'num' }, r.all.R.toFixed(3)),
+      h('td', { class: 'num' }, h('b', {}, r.all.mAP50.toFixed(3))), h('td', { class: 'num' }, r.all['mAP50-95'].toFixed(3)),
+      h('td', { class: 'num', title: 'detections at 0.5 confidence or higher that match no label' }, r.false50 ?? '—'))))));
+  const perClass = real.map((r) => h('details', {},
+    h('summary', { class: 'small', style: { cursor: 'pointer' } }, `${r.name}: per class, prediction images (${r.overlays.length})`),
+    h('table', { class: 'stage-table' },
+      h('thead', {}, h('tr', {}, ['class', 'inst', 'P', 'R', 'AP50', 'AP50-95'].map((c, i) => h('th', { class: i ? 'num' : '' }, c)))),
+      h('tbody', {}, Object.entries(r.per_class).map(([n, m]) => h('tr', {}, h('td', {}, n), h('td', { class: 'num' }, fmtInt(m.instances)),
+        h('td', { class: 'num' }, m.P.toFixed(3)), h('td', { class: 'num' }, m.R.toFixed(3)),
+        h('td', { class: 'num' }, m.AP50.toFixed(3)), h('td', { class: 'num' }, m['AP50-95'].toFixed(3)))))),
+    r.overlays.length ? h('p', { class: 'muted small' }, 'Coloured boxes / masks: the model (confidence ≥ 0.35). Thin white boxes: the human labels.') : null,
+    r.overlays.length ? thumbs(d, r.overlays) : null,
+    h('div', { class: 'row' }, btn('Open folder', () => api('/api/open', { path: r.dir }).catch((e) => toast(e.message, 'bad')), { kind: 'small', icon: 'folder' }))));
+  return h('div', { class: 'stack', style: { gap: '8px' } }, head, table, ...perClass);
+}
+
+function evaluateSection(d) {
+  const o = T.opts;
+  const dataIn = h('textarea', { rows: 2, spellcheck: false, class: 'wide mono', placeholder: 'real datasets, one per line: …/data.yaml or a Roboflow .zip' });
+  dataIn.value = (o.real_sets || []).map((x) => x.path).join('\n');
+  const add = btn('Add', async () => {
+    const r = await api('/api/browse', { kind: 'real', initial: dataIn.value.split('\n').pop() || '' });
+    if (r.path) dataIn.value = (dataIn.value.trim() ? dataIn.value.trim() + '\n' : '') + r.path;
+  }, { kind: 'small', icon: 'folder', busy: '…' });
+  const splitsIn = h('input', { type: 'text', value: 'valid test', style: { width: '110px' }, title: 'Splits of the real datasets to score' });
+  const unIn = h('input', { type: 'text', value: o.real_unstretch ?? '1280 720', style: { width: '110px' },
+    title: 'Square (Roboflow-stretched) images are resized to W H before scoring; empty = off' });
+  return h('div', { class: 'stack', style: { gap: '6px' } },
+    h('h3', {}, 'Score on real images'),
+    h('p', { class: 'muted small' }, 'mAP on real labelled images (classes matched by name). Results go to real_eval/ in the run folder and show up above.'),
+    h('div', { class: 'path-input' }, dataIn, add),
+    h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'splits'), splitsIn, h('span', { class: 'muted small' }, 'unstretch'), unIn,
+      h('span', { class: 'grow' }),
+      btn('Evaluate', () => {
+        const data = dataIn.value.split('\n').map((x) => x.trim()).filter(Boolean);
+        o.real_sets = data.map((p) => ({ path: p, label: p.split('/').slice(-2)[0] }));
+        o.real_unstretch = unIn.value.trim();
+        return tool('evaluate', { data, splits: splitsIn.value, unstretch: unIn.value.trim() });
+      }, { kind: 'small', icon: 'target', busy: 'Starting', disabled: !d.best_pt })));
 }
 
 async function tool(name, extra = {}) {

@@ -58,7 +58,8 @@ DEFAULTS = {
     "post": {
         "python": "",                       # interpreter with numpy + opencv; "" = default_python()
         "workers": 6,
-        "train": "",                        # "", "seg", "pose" or "both": start training afterwards
+        "train": "",                        # "", "seg", "pose", "both" or "quick": start training afterwards
+                                            # (quick = seg, 30 epochs, scored on the real datasets set in the app)
         "train_args": "",
         "open_trainer": False,              # after a full render: open the SDG app's Train page with this dataset
     },
@@ -102,10 +103,11 @@ TOP_KEYS = {"name", "map", "seed"} | set(DEFAULTS)
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 RANDOMIZER_TYPES = ("float", "double", "bool", "color", "vector", "transform", "visible", "mpc",
-                    "material_param", "material", "postprocess")
+                    "material_param", "material", "postprocess", "image")
 SDG_MPC = "/Game/SDG/MPC_SDG"
 FACINGS = ("auto", "-auto", "+x", "-x", "+y", "-y", "+z", "-z")
 FOG_DENSITY, FOG_COLOR = "water_fog_density", "water_fog_color"
+POST_TRAIN = ("", "seg", "pose", "both", "quick")
 
 
 def _merge(base, over):
@@ -131,6 +133,55 @@ def default_python():
              os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
              os.path.join(os.path.expanduser("~"), "seg-train", ".venv", "Scripts", "python.exe")]
     return next((c.replace("\\", "/") for c in cands if c and os.path.isfile(c)), "")
+
+
+def app_settings():
+    """The SDG app's settings (app/state/settings.json), {} if it was never saved."""
+    path = os.path.join(os.environ.get("SDG_APP_STATE", os.path.join(ROOT, "app", "state")), "settings.json")
+    try:
+        import json
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def default_real_sets():
+    """Real labelled datasets to score models on when none are set in the app: the Roboflow exports
+    of the torpedo board in Downloads (unpacked folder or the zip)."""
+    dl = os.path.join(os.path.expanduser("~"), "Downloads")
+    out = []
+    for stem in ("Torpedo_RS.v1i.yolov11", "Tropedo.v1i.yolov11"):
+        folder, z = os.path.join(dl, stem, "data.yaml"), os.path.join(dl, stem + ".zip")
+        p = folder if os.path.isfile(folder) else z if os.path.isfile(z) else None
+        if p:
+            out.append(p.replace("\\", "/"))
+    return out
+
+
+def merge_real_sets(sets, extra):
+    """sets + extra (a path, or None) without duplicates (paths compared case- and slash-insensitively)."""
+    out, seen = [], set()
+    for p in list(sets or []) + ([extra] if extra else []):
+        key = os.path.normcase(os.path.normpath(str(p)))
+        if p and key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def real_sets():
+    """Real datasets from the app's settings (real_sets), else the defaults plus an older app's single real_data."""
+    s = app_settings()
+    sets = s.get("real_sets")
+    if sets is None:
+        sets = merge_real_sets(default_real_sets(), s.get("real_data"))
+    return [p for p in sets if p and os.path.exists(p)]
+
+
+def real_unstretch():
+    """"W H" the Roboflow-stretched real images are resized back to before scoring ("" = off)."""
+    return str(app_settings().get("real_unstretch", "1280 720") or "")
 
 
 def find_config(arg):
@@ -159,6 +210,11 @@ def load_config(path):
             cfg[sec][key] = resolve_path(cfg[sec][key])
     if not cfg["post"]["python"]:
         cfg["post"]["python"] = default_python()
+    for rz in cfg["randomize"]:             # "image" without a value: every image equally often
+        if randomizer_type(rz) == "image" and "value" not in rz:
+            prop = next((p for p in cfg["props"] if p.get("name") == rz.get("prop")), None)
+            if prop is not None and isinstance(prop.get("images"), list):
+                rz["value"] = {"choice": list(range(len(prop["images"]) + 1))}
     fog = cfg["water_fog"]
     if fog["enabled"]:                      # sugar for two MPC randomizers driving M_SDG_WaterFog
         base = {"mpc": SDG_MPC, "every": fog["every"], "smooth": fog["smooth"]}
@@ -216,6 +272,9 @@ def validate(cfg):
     if r["exr_compression"] not in ("zip", "zips", "none"):
         _err("render.exr_compression", "zip, zips or none (PIZ/DWA can't be read by the dataset builder)")
 
+    if cfg["post"]["train"] not in POST_TRAIN:
+        _err("post.train", f"one of {', '.join(repr(t) for t in POST_TRAIN)}")
+
     seg, pose = cfg["seg_classes"], cfg["pose_classes"]
     for key, names in (("seg_classes", seg), ("pose_classes", pose)):
         if len(set(names)) != len(names):
@@ -243,6 +302,7 @@ def validate(cfg):
                     _err(where, f"region class {cls!r} is not in seg_classes")
                 if not os.path.isfile(resolve_path(png)):
                     _err(where, f"mask not found: {resolve_path(png)}")
+            _check_images(where, p, seg)
         elif kind == "material_slots":
             if not isinstance(p.get("slots"), dict) or not p["slots"]:
                 _err(where, "needs \"slots\" = { \"*Pattern*\" = \"class\" }")
@@ -253,6 +313,8 @@ def validate(cfg):
                     _err(where, f"slot class {cls!r} is not in seg_classes")
         else:
             _err(where, "type must be actor, texture_regions or material_slots")
+        if kind != "texture_regions" and "images" in p:
+            _err(where, "images only works for texture_regions props")
         if p.get("body_class") is not None and p["body_class"] not in seg:
             _err(where, f"body_class {p['body_class']!r} is not in seg_classes")
         if p.get("pose_class") is not None:
@@ -279,11 +341,16 @@ def validate(cfg):
             _err(where, "needs material_slot (index)")
         if kind in ("float", "double", "bool", "color", "material_param") and not rz.get("property") and not rz.get("param"):
             _err(where, "needs property = \"Name\"")
-        if kind not in ("mpc", "postprocess") and not (rz.get("actor") or rz.get("tag")):
+        if kind == "image":
+            prop = next((p for p in cfg["props"] if p["name"] == rz.get("prop")), None)
+            if prop is None or not prop.get("images"):
+                _err(where, "needs prop = \"<name>\" of a texture_regions prop that has images = [...]")
+            _check_image_value(where, rz.get("value"), len(prop["images"]) + 1)
+        elif kind not in ("mpc", "postprocess") and not (rz.get("actor") or rz.get("tag")):
             _err(where, "needs actor = \"Label*\" (or tag = \"...\")")
         if kind == "transform" and not any(k in rz for k in ("location", "rotation", "scale")):
             _err(where, "transform needs location, rotation and/or scale")
-        if kind not in ("transform", "visible") and "value" not in rz:
+        if kind not in ("transform", "visible", "image") and "value" not in rz:
             _err(where, "needs value = [min, max] (or another value spec)")
         v = rz.get("value")
         if isinstance(v, list) and len(v) == 2 and all(_is_num(x) for x in v) and v[0] > v[1]:
@@ -346,6 +413,68 @@ def validate(cfg):
         for key in st.get("disable", []):
             if key not in rnames:
                 _err(where, f"disable {key!r} is not a randomizer name")
+        for rz in stage_randomizers(cfg, st):
+            if randomizer_type(rz) == "image" and rz["name"] in st.get("override", {}):
+                prop = next(p for p in cfg["props"] if p["name"] == rz["prop"])
+                _check_image_value(f"{where} override {rz['name']}", rz.get("value"), len(prop["images"]) + 1)
+
+
+def _check_images(where, p, seg):
+    """images = ["props/<prop>/images/<name>/texture.png", ...]: one folder per image, its masks next to it."""
+    if "images" not in p:
+        return
+    imgs = p["images"]
+    if not isinstance(imgs, list) or not all(isinstance(x, str) for x in imgs):
+        _err(where, "images = [\"props/<prop>/images/<name>/texture.png\", ...]")
+    folders = set()
+    for rel in imgs:
+        path = resolve_path(rel)
+        if not os.path.isfile(path):
+            _err(where, f"image not found: {path}")
+        folder = os.path.dirname(path)
+        if folder in folders:
+            _err(where, f"two images in {folder}: give every image its own folder (its T_Mask_<class>.png sit next to it)")
+        folders.add(folder)
+        if not any(os.path.isfile(f"{folder}/T_Mask_{c}.png") for c in seg):
+            _err(where, f"no T_Mask_<class>.png next to {path} - make them with tools/prop_image.py")
+
+
+def prop_images(prop, seg):
+    """What a texture_regions prop can show, one entry per image number:
+    0 = `texture` as it is in the level (masks from `regions`), 1.. = the `images` entries in order
+    (masks = T_Mask_<class>.png next to each image; a class without a mask is not on that image).
+    -> [{"image": png path or None for 0, "regions": {class: mask png path}}]"""
+    out = [{"image": None, "regions": {c: resolve_path(m) for c, m in prop["regions"].items()}}]
+    for rel in prop.get("images", []):
+        path = resolve_path(rel)
+        folder = os.path.dirname(path)
+        out.append({"image": path, "regions": {c: f"{folder}/T_Mask_{c}.png" for c in seg
+                                               if os.path.isfile(f"{folder}/T_Mask_{c}.png")}})
+    return out
+
+
+def _check_image_value(where, v, count):
+    """Values of an "image" randomizer are image numbers 0 .. count-1."""
+    msg = (f"value: image numbers 0..{count - 1} (0 = the prop's texture, 1.. = its images), "
+           f"e.g. {{ choice = {list(range(count))} }} or {{ choice = [...], weights = [...] }}")
+    if v is None:
+        return
+    if isinstance(v, dict) and "choice" in v:
+        vals = v["choice"]
+        if not isinstance(vals, list) or not vals:
+            _err(where, msg)
+        w = v.get("weights")
+        if w is not None and (not isinstance(w, list) or len(w) != len(vals) or not all(_is_num(x) and x >= 0 for x in w)
+                              or not any(x > 0 for x in w)):
+            _err(where, "weights: one number >= 0 per choice")
+    elif isinstance(v, dict) and "randint" in v:
+        vals = v["randint"]
+        if not (isinstance(vals, list) and len(vals) == 2 and vals[0] <= vals[1]):
+            _err(where, msg)
+    else:
+        vals = [v]
+    if not all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x < count for x in vals):
+        _err(where, msg)
 
 
 def stage_camera(cfg, stage):

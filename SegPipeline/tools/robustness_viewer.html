@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robustness Viewer</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --panel-2: #eef0f3; --text: #1b1f24; --muted: #5d6673;
+  --line: #d9dde3; --accent: #1f6feb; --accent-soft: #dbe8fd; --good: #1a7f37; --bad: #cf222e;
+  --warn: #9a6700; --img-bg: #e3e6ea;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #191d23; --panel-2: #20252c; --text: #e6e9ed; --muted: #97a1ad;
+    --line: #2d333b; --accent: #4c93ff; --accent-soft: #1d2f4d; --good: #3fb950; --bad: #f85149;
+    --warn: #d29922; --img-bg: #0b0d10;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: grid; grid-template-rows: auto 1fr; }
+button, select, input { font: inherit; color: inherit; }
+button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+button.link { background: none; border: none; padding: 0 2px; color: var(--muted); font-size: 12px; }
+button.link:hover { color: var(--accent); }
+
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 15px; margin: 0 6px 0 0; font-weight: 650; }
+.chip { display: inline-flex; gap: 6px; align-items: center; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 3px 10px; max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.chip.empty { color: var(--muted); border-style: dashed; }
+.spacer { flex: 1; }
+#status { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 220px; text-align: right; }
+#status.err { color: var(--bad); }
+
+main { display: grid; grid-template-columns: 330px 1fr; min-height: 0; }
+aside { overflow-y: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 6px 0 40px; }
+details { border-bottom: 1px solid var(--line); }
+summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  font-weight: 600; user-select: none; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "\25B8"; color: var(--muted); transition: transform .1s; }
+details[open] summary::before { transform: rotate(90deg); }
+summary .badge { background: var(--accent); color: #fff; border-radius: 999px; font-size: 11px; padding: 0 7px; }
+summary .badge:empty { display: none; }
+summary .link { margin-left: auto; }
+.rows { padding: 0 14px 10px; display: grid; gap: 6px; }
+.row { display: grid; grid-template-columns: 1fr 64px; grid-template-areas: "lab num" "rng rng"; gap: 1px 8px; align-items: center; }
+.row label { grid-area: lab; color: var(--muted); cursor: default; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.changed label { color: var(--accent); font-weight: 600; }
+.row input[type=number] { grid-area: num; width: 64px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 4px; text-align: right; font-variant-numeric: tabular-nums; }
+.row input[type=range] { grid-area: rng; width: 100%; accent-color: var(--accent); margin: 2px 0 0; }
+.row.check, .row.pick { grid-template-columns: 1fr auto; grid-template-areas: "lab ctl"; }
+.row.check input, .row.pick select, .row.pick input { grid-area: ctl; accent-color: var(--accent); }
+.row.pick select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; }
+.row.pick input[type=color] { width: 44px; height: 22px; border: 1px solid var(--line); border-radius: 4px; padding: 0; background: none; }
+.hint { color: var(--muted); font-size: 12px; }
+
+.view { overflow: auto; padding: 14px; display: grid; gap: 14px; align-content: start; min-width: 0; }
+.active { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-height: 26px; }
+.active .tag { background: var(--accent-soft); color: var(--accent); border-radius: 999px; padding: 2px 9px; cursor: pointer; border: none; }
+.active .tag:hover { text-decoration: line-through; }
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.panels.single { grid-template-columns: 1fr; }
+.panels.single #clean-fig { display: none; }
+figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; }
+figcaption { display: flex; gap: 10px; align-items: baseline; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+figcaption b { font-weight: 650; }
+figcaption span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.frame { background: var(--img-bg); display: grid; place-items: center; min-height: 240px; position: relative; }
+.frame img { max-width: 100%; max-height: calc(100vh - 230px); display: block; }
+#dist-img { cursor: crosshair; }
+.placeholder { color: var(--muted); padding: 40px 20px; text-align: center; }
+
+table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  overflow: hidden; font-variant-numeric: tabular-nums; }
+th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--line); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 600; background: var(--panel-2); }
+tr:last-child td { border-bottom: none; }
+td.bad { color: var(--bad); font-weight: 600; }
+td.warn { color: var(--warn); font-weight: 600; }
+td.good { color: var(--good); }
+
+#drop { position: fixed; inset: 0; background: color-mix(in srgb, var(--accent) 18%, transparent); border: 3px dashed var(--accent);
+  display: none; place-items: center; font-size: 20px; font-weight: 650; color: var(--accent); z-index: 10; pointer-events: none; }
+body.dragging #drop { display: grid; }
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  aside { max-height: 45vh; border-right: none; border-bottom: 1px solid var(--line); }
+  .panels { grid-template-columns: 1fr; }
+  #status { min-width: 0; text-align: left; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Robustness viewer</h1>
+  <span class="chip empty" id="model-chip">no model</span>
+  <span class="chip empty" id="image-chip">no image</span>
+  <button id="btn-model">Load .pt</button>
+  <button id="btn-image">Load image</button>
+  <input type="file" id="file-model" accept=".pt" hidden>
+  <input type="file" id="file-image" accept="image/*" hidden>
+  <span class="spacer"></span>
+  <button id="btn-random" title="Random moderate distortions">Randomize</button>
+  <button id="btn-seed" title="New noise, particles, random blocks">New seed</button>
+  <button id="btn-animate" title="Re-roll the random effects continuously">Animate</button>
+  <button id="btn-side" class="on" title="Show the clean image's predictions next to the distorted one">Side by side</button>
+  <button id="btn-reset">Reset all</button>
+  <a id="btn-save" href="/api/distorted.png"><button tabindex="-1" title="Download the distorted image (no overlay)">Save image</button></a>
+  <span id="status">drop a .pt and an image anywhere</span>
+</header>
+<main>
+  <aside id="controls"></aside>
+  <section class="view">
+    <div class="active" id="active"></div>
+    <div class="panels" id="panels">
+      <figure id="clean-fig">
+        <figcaption><b>Clean</b><span id="clean-cap"></span></figcaption>
+        <div class="frame"><img id="clean-img" alt="" hidden><div class="placeholder" id="clean-ph">Predictions on the original image</div></div>
+      </figure>
+      <figure>
+        <figcaption><b>Distorted</b><span id="dist-cap"></span></figcaption>
+        <div class="frame"><img id="dist-img" alt="" hidden title="Click: add a block here. Right-click: remove the nearest."><div class="placeholder" id="dist-ph">Load a model (.pt) and an image: drop them here, paste an image, or use the buttons above.</div></div>
+      </figure>
+    </div>
+    <table id="compare" hidden>
+      <thead><tr><th>Class</th><th>Clean found</th><th>Clean best conf</th><th>Distorted found</th><th>Distorted best conf</th><th>Change</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<div id="drop">Drop a .pt model or an image</div>
+<script>
+const $ = (s) => document.querySelector(s);
+let S = null;             // server state: controls, defaults, names, model, image
+let P = {};               // current parameters
+let cleanKey = null, lastClean = null;
+let dirty = false, busy = false, animate = false;
+let frames = [];
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('rv.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('rv.' + k, JSON.stringify(v)); } catch {} },
+};
+
+function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// ---------------------------------------------------------------- controls
+const allControls = () => S.controls.flatMap(g => g.items);
+const isChanged = (c) => JSON.stringify(P[c.key]) !== JSON.stringify(c.default);
+const decimals = (step) => (String(step).split('.')[1] || '').length;
+
+function buildControls() {
+  const aside = $('#controls');
+  aside.innerHTML = '';
+  const open = store.get('open', {});
+  for (const g of S.controls) {
+    const d = document.createElement('details');
+    d.open = open[g.group] ?? (g.model || ['Light', 'Colour', 'Blur & sharpness'].includes(g.group));
+    d.addEventListener('toggle', () => { const o = store.get('open', {}); o[g.group] = d.open; store.set('open', o); });
+    const sum = document.createElement('summary');
+    sum.innerHTML = `<span>${g.group}</span><span class="badge"></span>`;
+    const rst = document.createElement('button');
+    rst.className = 'link'; rst.textContent = 'reset';
+    rst.onclick = (e) => { e.preventDefault(); e.stopPropagation(); g.items.forEach(c => P[c.key] = c.default);
+      if (g.group === 'Occlusion') P.occ_points = []; changed(); };
+    sum.appendChild(rst);
+    d.appendChild(sum);
+    const rows = document.createElement('div');
+    rows.className = 'rows';
+    for (const c of g.items) rows.appendChild(buildRow(c));
+    if (g.group === 'Occlusion') {
+      const h = document.createElement('div');
+      h.className = 'hint';
+      h.innerHTML = 'Click the distorted image to place a block, right-click to remove one. <button class="link" id="clear-pts">clear placed blocks</button>';
+      rows.appendChild(h);
+    }
+    d.appendChild(rows);
+    g.badge = sum.querySelector('.badge');
+    aside.appendChild(d);
+  }
+  $('#clear-pts').onclick = () => { P.occ_points = []; changed(); };
+}
+
+function buildRow(c) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.dataset.key = c.key;
+  const lab = document.createElement('label');
+  lab.textContent = c.label;
+  lab.title = (c.doc ? c.doc + '\n' : '') + 'Double-click to reset';
+  lab.ondblclick = () => { P[c.key] = c.default; changed(); };
+  row.appendChild(lab);
+  if (c.type === 'range') {
+    const num = document.createElement('input');
+    num.type = 'number'; num.min = c.min; num.max = c.max; num.step = c.step;
+    const rng = document.createElement('input');
+    rng.type = 'range'; rng.min = c.min; rng.max = c.max; rng.step = c.step;
+    rng.oninput = () => { P[c.key] = +rng.value; changed(); };
+    num.onchange = () => { const v = Math.min(c.max, Math.max(c.min, +num.value)); if (!isNaN(v)) { P[c.key] = v; changed(); } };
+    row.append(num, rng);
+    row.sync = () => { rng.value = P[c.key]; num.value = (+P[c.key]).toFixed(decimals(c.step)); };
+  } else if (c.type === 'bool') {
+    row.classList.add('check');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.onchange = () => { P[c.key] = cb.checked; changed(); };
+    lab.onclick = () => { cb.checked = !cb.checked; cb.onchange(); };
+    row.appendChild(cb);
+    row.sync = () => { cb.checked = !!P[c.key]; };
+  } else if (c.type === 'select') {
+    row.classList.add('pick');
+    const sel = document.createElement('select');
+    for (const o of c.options) sel.add(new Option(o, o));
+    sel.onchange = () => { P[c.key] = sel.value; changed(); };
+    row.appendChild(sel);
+    row.sync = () => { sel.value = P[c.key]; };
+  } else if (c.type === 'color') {
+    row.classList.add('pick');
+    const col = document.createElement('input');
+    col.type = 'color';
+    col.oninput = () => { P[c.key] = col.value; changed(); };
+    row.appendChild(col);
+    row.sync = () => { col.value = P[c.key]; };
+  }
+  return row;
+}
+
+function syncControls() {
+  for (const row of document.querySelectorAll('.row')) {
+    row.sync();
+    row.classList.toggle('changed', isChanged(allControls().find(c => c.key === row.dataset.key)));
+  }
+  for (const g of S.controls) {
+    const n = g.items.filter(isChanged).length + (g.group === 'Occlusion' && P.occ_points.length ? 1 : 0);
+    g.badge.textContent = n || '';
+  }
+  // active distortions summary: click one to reset it
+  const act = $('#active');
+  act.innerHTML = '';
+  for (const g of S.controls) {
+    if (g.model) continue;
+    for (const c of g.items.filter(isChanged)) {
+      const b = document.createElement('button');
+      b.className = 'tag';
+      b.title = 'Reset';
+      b.textContent = c.type === 'range' ? `${c.label} ${(+P[c.key]).toFixed(decimals(c.step))}` :
+                      c.type === 'bool' ? c.label : `${c.label}: ${P[c.key]}`;
+      b.onclick = () => { P[c.key] = c.default; changed(); };
+      act.appendChild(b);
+    }
+  }
+  if (P.occ_points.length) {
+    const b = document.createElement('button');
+    b.className = 'tag'; b.textContent = `${P.occ_points.length} placed block(s)`;
+    b.onclick = () => { P.occ_points = []; changed(); };
+    act.appendChild(b);
+  }
+  if (!act.children.length) act.innerHTML = '<span class="hint">No distortions: both panels show the same image. Move a slider.</span>';
+}
+
+function changed() {
+  syncControls();
+  store.set('params', P);
+  dirty = true;
+  pump();
+}
+
+// ---------------------------------------------------------------- inference loop
+async function pump() {
+  if (busy || !dirty || !S || !S.model || !S.image) return;
+  dirty = false;
+  busy = true;
+  try {
+    const r = await api('/api/infer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ params: P, clean_key: cleanKey }) });
+    if (r.clean) { lastClean = r.clean; cleanKey = r.clean_key; show('clean', r.clean); }
+    show('dist', r.distorted);
+    compare(lastClean, r.distorted);
+    const now = performance.now();
+    frames = frames.filter(t => now - t < 2000); frames.push(now);
+    const fps = frames.length > 1 ? ((frames.length - 1) / ((now - frames[0]) / 1000)).toFixed(1) : '-';
+    status(`distort ${r.distorted.distort_ms} ms · model ${r.distorted.ms} ms · ${fps} fps · ${S.device}`);
+  } catch (e) {
+    status(e.message, true);
+  } finally {
+    busy = false;
+    if (animate) { P.seed = Math.floor(Math.random() * 2 ** 31); dirty = true; }
+    if (dirty) setTimeout(pump, 0);         // not requestAnimationFrame: it pauses while the window is in the background
+  }
+}
+
+function show(which, part) {
+  const img = $(`#${which}-img`);
+  img.src = part.image;
+  img.hidden = false;
+  $(`#${which}-ph`).hidden = true;
+  const n = part.dets.length;
+  $(`#${which}-cap`).textContent = `${n} detection${n === 1 ? '' : 's'} · ${part.size[0]}×${part.size[1]} · ${part.ms} ms`;
+}
+
+function summarize(part) {
+  const m = {};
+  for (const d of (part ? part.dets : [])) {
+    const s = m[d.name] || (m[d.name] = { n: 0, best: 0 });
+    s.n++; s.best = Math.max(s.best, d.conf);
+  }
+  return m;
+}
+
+function compare(clean, dist) {
+  const a = summarize(clean), b = summarize(dist);
+  const names = [...new Set([...(S.names || []), ...Object.keys(a), ...Object.keys(b)])];
+  const tb = $('#compare tbody');
+  tb.innerHTML = '';
+  for (const name of names) {
+    const x = a[name] || { n: 0, best: 0 }, y = b[name] || { n: 0, best: 0 };
+    let change = '', cls = '';
+    if (x.n && !y.n) { change = 'lost'; cls = 'bad'; }
+    else if (!x.n && y.n) { change = `+${y.n} new`; cls = 'warn'; }
+    else if (x.n || y.n) {
+      const dn = y.n - x.n, dc = y.best - x.best;
+      change = (dn ? `${dn > 0 ? '+' : ''}${dn} · ` : '') + `${dc >= 0 ? '+' : ''}${dc.toFixed(2)} conf`;
+      cls = dn < 0 || dc < -0.15 ? 'bad' : dn > 0 ? 'warn' : dc >= -0.05 ? 'good' : '';
+    }
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${name}</td><td>${x.n}</td><td>${x.n ? x.best.toFixed(2) : '–'}</td>` +
+                   `<td>${y.n}</td><td>${y.n ? y.best.toFixed(2) : '–'}</td><td class="${cls}">${change || '–'}</td>`;
+    tb.appendChild(tr);
+  }
+  $('#compare').hidden = !names.length;
+}
+
+// ---------------------------------------------------------------- loading
+function chips() {
+  const m = $('#model-chip'), i = $('#image-chip');
+  m.classList.toggle('empty', !S.model);
+  m.innerHTML = S.model ? `<b>${S.model}</b> ${S.task} · ${S.names.length} classes` : 'no model';
+  m.title = S.model_path || '';
+  i.classList.toggle('empty', !S.image);
+  i.innerHTML = S.image ? `<b>${S.image}</b> ${S.size[0]}×${S.size[1]}` : 'no image';
+}
+
+async function upload(kind, file) {
+  status(kind === 'model' ? `loading ${file.name} …` : `loading ${file.name || 'image'} …`);
+  try {
+    const st = await api(`/api/${kind}`, { method: 'POST', body: file,
+      headers: { 'X-Filename': (file.name || 'pasted.png').replace(/[^\x20-\x7e]/g, '_') } });
+    Object.assign(S, st);
+    chips();
+    cleanKey = null;
+    if (kind === 'image') P.occ_points = [];
+    status(kind === 'model' ? `loaded ${S.model}` : `loaded ${S.image}`);
+    changed();
+  } catch (e) { status(e.message, true); }
+}
+
+function handleFiles(files) {
+  for (const f of files) {
+    if (/\.pt$/i.test(f.name)) upload('model', f);
+    else if (f.type.startsWith('image/') || /\.(jpe?g|png|bmp|tiff?|webp)$/i.test(f.name)) upload('image', f);
+    else status(`${f.name}: not a .pt or an image`, true);
+  }
+}
+
+$('#btn-model').onclick = () => $('#file-model').click();
+$('#btn-image').onclick = () => $('#file-image').click();
+$('#file-model').onchange = (e) => { handleFiles(e.target.files); e.target.value = ''; };
+$('#file-image').onchange = (e) => { handleFiles(e.target.files); e.target.value = ''; };
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => { e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging'); handleFiles(e.dataTransfer.files); });
+window.addEventListener('paste', (e) => {
+  const f = [...(e.clipboardData?.files || [])].find(f => f.type.startsWith('image/'));
+  if (f) upload('image', f);
+});
+
+// ---------------------------------------------------------------- buttons
+$('#btn-reset').onclick = () => { for (const c of allControls()) if (!S.controls.find(g => g.model).items.includes(c)) P[c.key] = c.default;
+                                  P.occ_points = []; changed(); };
+$('#btn-seed').onclick = () => { P.seed = Math.floor(Math.random() * 2 ** 31); changed(); };
+$('#btn-random').onclick = () => {
+  for (const g of S.controls) {
+    if (g.model) continue;
+    for (const c of g.items) {
+      if (c.type !== 'range' || !c.rand) continue;
+      if (Math.random() < 0.55) { P[c.key] = c.default; continue; }
+      const v = c.rand[0] + Math.random() * (c.rand[1] - c.rand[0]);
+      P[c.key] = +(Math.round(v / c.step) * c.step).toFixed(decimals(c.step));
+    }
+  }
+  P.seed = Math.floor(Math.random() * 2 ** 31);
+  changed();
+};
+$('#btn-animate').onclick = () => {
+  animate = !animate;
+  $('#btn-animate').classList.toggle('on', animate);
+  frames = [];
+  if (animate) { dirty = true; pump(); }
+};
+$('#btn-side').onclick = () => {
+  const single = $('#panels').classList.toggle('single');
+  $('#btn-side').classList.toggle('on', !single);
+  store.set('single', single);
+};
+$('#btn-save').onclick = (e) => { if ($('#dist-img').hidden) { e.preventDefault(); status('nothing to save yet', true); } };
+
+// place / remove blocks on the distorted image
+$('#dist-img').addEventListener('click', (e) => {
+  const r = e.target.getBoundingClientRect();
+  P.occ_points = [...P.occ_points, [+((e.clientX - r.left) / r.width).toFixed(4), +((e.clientY - r.top) / r.height).toFixed(4)]];
+  changed();
+});
+$('#dist-img').addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (!P.occ_points.length) return;
+  const r = e.target.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  let best = 0, bd = Infinity;
+  P.occ_points.forEach(([px, py], i) => { const d = (px - x) ** 2 + (py - y) ** 2; if (d < bd) { bd = d; best = i; } });
+  P.occ_points = P.occ_points.filter((_, i) => i !== best);
+  changed();
+});
+
+// ---------------------------------------------------------------- start
+(async () => {
+  try {
+    S = await api('/api/state');
+  } catch (e) { status('server not reachable: ' + e.message, true); return; }
+  const saved = store.get('params', {});
+  P = { ...S.defaults };
+  for (const k of Object.keys(saved)) if (k in P) P[k] = saved[k];
+  P.occ_points = [];
+  if (store.get('single', false)) { $('#panels').classList.add('single'); $('#btn-side').classList.remove('on'); }
+  buildControls();
+  chips();
+  changed();
+})();
+</script>
+</body>
+</html>

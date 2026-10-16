@@ -10,6 +10,7 @@ seg_config.json      <- the only file you edit per prop / class
 tools/
   export_texture.py        (UE)  texture asset -> PNG
   make_texture_masks.ps1   (PC)  PNG with drawings -> one mask per drawing
+  prop_image.py            (PC)  another image for a prop (sdg "image" randomizer): holes + masks
   setup_segmentation.py    (UE)  config -> stencil tagging, M_SegMask, render targets
   mask_to_yolo.ps1         (PC)  captured masks -> YOLO-seg dataset + data.yaml
 props/<prop>/              masks + previews per prop
@@ -47,6 +48,9 @@ Add to `props` in `seg_config.json`. Match actors by label wildcard and/or tag
 { "name": "<prop>", "type": "texture_regions", "texture": "/Game/Path/To/Texture",
   "regions": { "a": "props/<prop>/T_Mask_a.png", "b": "props/<prop>/T_Mask_b.png" } }
 ```
+4. (sdg only) More images for the same prop, randomized per image: one folder per image made with
+   `.venv\Scripts\python.exe tools\prop_image.py <image.png> --out props\<prop>\images\<name> --classes a,b,c --holes-like props\<prop>\texture.png`,
+   then `images = [...]` on the prop and an `image` randomizer (see `sdg/README.md`, Randomizers).
 
 **C. Only part of a mesh is the class, and that part has its own material** (e.g. the yellow X/O on a bin)
 
@@ -133,12 +137,24 @@ render pipeline find it on their own. To use a venv somewhere else, set `SDG_PYT
 `python.exe`. An existing `%USERPROFILE%\seg-train\.venv` is also picked up.
 
 ```
-.venv\Scripts\python.exe train\train_seg.py --data <dataset>\data.yaml --name <run name>
+.venv\Scripts\python.exe train\train_yolo.py --task seg --data <dataset>\seg.yaml --quick --eval <real>\data.yaml <other real>.zip
+.venv\Scripts\python.exe train\train_yolo.py --task seg --data <dataset>\seg.yaml --name <run name>
 ```
-`train/train_seg.py` applies heavy augmentation aimed at generalization: colour/hue shifts,
-grayscale, blur/defocus, noise, JPEG, low-res, fog; plus scale, rotation, perspective, mosaic
-and copy-paste. Options: `--model` (default `yolo11s-seg.pt`), `--epochs`, `--imgsz`, `--batch`,
-`--freeze N` (for fine-tuning on a few real images).
+The recipe lives in `train/recipe.py` (also used by `train_seg.py`, the SDG app and the yolo-training
+repo's `underwater` preset): heavy augmentation aimed at generalization (colour/hue shifts, grayscale,
+blur/defocus, noise, JPEG, low-res; scale, rotation, perspective, mosaic, mixup, copy-paste).
+
+- `--quick`: 30 epochs, patience 10, for trying things out (the SDG app's **Quick train** runs this).
+  A full run is 150 epochs, patience 40.
+- `--eval <real datasets>`: when training ends, score `best.pt` on real labelled images (data.yaml or the
+  Roboflow .zip; square images are unstretched to `--unstretch 1280 720`) -> `<run>\real_eval\`.
+  Same scoring as `train\eval_real.py`.
+- Speed: 12 loader workers and no RandomFog by default. With RandomFog (about 1 s per image it runs on)
+  the CPU couldn't keep up and the GPU idled ~85% of the time; the renders have their own haze.
+  `--fog` brings it back. `tools\profile_train.py --run runs\<run>` measures where the time goes.
+- `--no-copy-paste`, `--no-mixup`, `--model` (default `yolo11s-seg.pt`), `--epochs`, `--imgsz`, `--batch`,
+  `--freeze N` (for fine-tuning on a few real images).
+
 Runs go to `SegPipeline\runs\<name>` (`weights\best.pt`, `results.png`, ...); `--project <dir>` changes that.
 Trained weights and `runs/` are git-ignored. Only the stock pretrained `yolo*.pt` files are committed.
 
@@ -156,3 +172,4 @@ The val mAP is computed on synthetic frames, so it will look optimistic. Judge t
 | RGB frames too dark / washed out | toggle **Force Linear Gamma** on RT_SegRGB |
 | Many frames with "no objects" | camera isn't aimed at `Target`, or it's too far away / outside the pool |
 | Some other actor lights up in Custom Stencil | it has Render CustomDepth on for something else; turn it off or give it stencil 0 |
+| SDG app shows "undefined", missing buttons or old results after an update | the app server still runs the old code: click **Restart app** in the banner, or double-click `SDG App.bat` (it replaces an app running older code) |

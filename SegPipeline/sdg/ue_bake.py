@@ -94,6 +94,8 @@ class Scene:
             self.instances[sid] = {"object": key, "part": part, "seg_class": cls}
 
         self.objects, self.copies = {}, copies
+        self.owners = {k: sorted(g, key=lambda a: a.get_name()) for k, g in owners.items()}
+        self._images = {}
         for key, group in sorted(owners.items()):
             owner = sorted(group, key=lambda a: a.get_name())[0]
             prop = props.get(key.split("#")[0])
@@ -117,6 +119,15 @@ class Scene:
             self.objects[key] = obj
         if not self.objects:
             warn("no tagged objects in the level - run setup (and check the props in the config match)")
+
+    def images(self, prop_name):
+        """Materials the "image" randomizer swaps for a prop (ue_setup.prepare_images; creates only
+        what is missing, e.g. when setup ran with another config)."""
+        if prop_name not in self._images:
+            prop = next(p for p in self.cfg["props"] if p["name"] == prop_name)
+            owners = [a for k, o in self.objects.items() if o["prop"] == prop_name for a in self.owners[k]]
+            self._images[prop_name] = us.prepare_images(prop, owners, self.cfg["seg_classes"], rebuild=False)
+        return self._images[prop_name]
 
     @staticmethod
     def _stencil(actor):
@@ -484,7 +495,12 @@ def bake_stage(cfg, scene, si, st, quick, raw_run):
     s_all = {}
     for rz in rzs:
         kind = sc.randomizer_type(rz)
-        targets = [(None, None)] if kind in ("mpc", "postprocess") else retarget(rz, kind, scene.find(rz))
+        if kind == "image":                                  # targets = the prop's objects (all their actors swap together)
+            targets = [(k, None) for k, o in scene.objects.items() if o["prop"] == rz["prop"]]
+        elif kind in ("mpc", "postprocess"):
+            targets = [(None, None)]
+        else:
+            targets = retarget(rz, kind, scene.find(rz))
         if not targets:
             warn(f"stage {name}: randomizer '{rz['name']}' matched nothing in the level - skipped")
             continue
@@ -492,7 +508,7 @@ def bake_stage(cfg, scene, si, st, quick, raw_run):
             make_movable(targets)
         per_target = bool(rz.get("per_target", False))
         every = int(rz.get("every", 1))
-        smooth = bool(rz.get("smooth", False)) and hold == 1
+        smooth = bool(rz.get("smooth", False)) and hold == 1 and kind != "image"
         vals = []
         for ti, tgt in enumerate(targets):
             s = sc.Sampler(f"{seed}:{name}:{rz['name']}:{ti if per_target else 0}")
@@ -503,6 +519,9 @@ def bake_stage(cfg, scene, si, st, quick, raw_run):
             elif kind == "visible":
                 p = float(rz.get("probability", 0.5))
                 vals.append(s.series({"choice": [True, False], "weights": [p, 1 - p]}, n, every, False))
+            elif kind == "image":
+                count = scene.images(rz["prop"])["count"]
+                vals.append([image_number(rz, v, count) for v in s.series(rz["value"], n, every, False)])
             else:
                 vals.append(apply_mode(rz, kind, tgt, scene, s.series(rz["value"], n, every, smooth)))
         rz_values[rz["name"]] = (rz, kind, targets, vals, every, smooth)
@@ -816,17 +835,67 @@ def write_randomizer(w, scene, rz, kind, obj, owner, keys, ip):
             else:
                 sec.add_scalar_parameter_key(pinfo, w.tick(f), float(v), "", "", ip)
     elif kind == "material":
-        track = w.bind(obj, owner).add_track(unreal.MovieScenePrimitiveMaterialTrack)
-        track.set_material_index(int(rz["material_slot"]))
-        sec = Writer.section(track)
-        ch = sec.get_all_channels()[0]
+        mats = []
         for f, v in keys:
             mat = unreal.load_asset(v)
             if mat is None:
                 raise RuntimeError(f"randomizer '{rz['name']}': material {v} not found")
-            ch.add_key(time=unreal.FrameNumber(f), new_value=mat)
+            mats.append((f, mat))
+        key_material(w, obj, owner, rz["material_slot"], mats)
+    elif kind == "image":
+        write_image(w, scene, rz, obj, keys)
     else:
         raise RuntimeError(f"randomizer '{rz['name']}': unsupported type {kind}")
+
+
+def key_material(w, comp, owner, slot, keys):
+    """Material swap track on one slot of a mesh component: keys = [(frame, material asset)]."""
+    track = w.bind(comp, owner).add_track(unreal.MovieScenePrimitiveMaterialTrack)
+    track.set_material_index(int(slot))
+    ch = Writer.section(track).get_all_channels()[0]
+    for f, mat in keys:
+        ch.add_key(time=unreal.FrameNumber(f), new_value=mat)
+
+
+def image_number(rz, v, count):
+    i = int(round(v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else -1
+    if i != v or not 0 <= i < count:
+        raise RuntimeError(f"randomizer '{rz['name']}': image {v!r} - use image numbers 0..{count - 1} "
+                           f"(0 = the prop's texture, 1.. = its images)")
+    return i
+
+
+def write_image(w, scene, rz, key, keys):
+    """Show image keys[i][1] on object `key` from frame keys[i][0]: its own textured slots get that image's
+    material and every label copy that image's mask for its class (M_SDG_None if the class isn't on it),
+    on the same frames, so the labels always match the picture. Stacked duplicates all swap together."""
+    img = scene.images(rz["prop"])
+    copies = scene.copies.get(key, [])
+    have = {us.tag_value(c, "sdg.part:") for c in copies}
+    missing = sorted(set(img["labels"]) - have)
+    if missing:
+        raise RuntimeError(f"randomizer '{rz['name']}': {key} has no label copies for {missing} (a class that only "
+                           f"some images have) - run setup with this config, then save the level")
+    for owner in scene.owners[key]:
+        for c in owner.get_components_by_class(unreal.StaticMeshComponent):
+            for i in range(c.get_num_materials()):
+                mat = c.get_material(i)
+                per = img["materials"].get(mat.get_path_name()) if mat else None
+                if per:
+                    key_material(w, c, owner, i, [(f, per[v]) for f, v in keys])
+    none_mat = unreal.load_asset(f"{us.CONTENT}/M_SDG_None")
+    used = {}
+    for cp in copies:
+        per = img["labels"].get(us.tag_value(cp, "sdg.part:"))
+        if per is None:                                     # the body copy
+            continue
+        per = [m or none_mat for m in per]
+        parent = cp.get_attach_parent_actor() or scene.owners[key][0]
+        if parent.get_name() not in used:
+            used[parent.get_name()] = us.textured_slots(parent, img["texture"])
+        for c in cp.get_components_by_class(unreal.StaticMeshComponent):
+            for i in used[parent.get_name()].get(c.get_name(), []):
+                key_material(w, c, cp, i, [(f, per[v]) for f, v in keys])
 
 
 # ============================================================================ entry

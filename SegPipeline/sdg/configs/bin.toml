@@ -1,0 +1,182 @@
+# SDG dataset recipe - written by the SDG app (SegPipeline/app).
+
+name = "bin_v1"
+map = "/Game/volume/water_volume"
+seed = 1
+
+# ---- output: where the dataset goes and what gets a label
+[output]
+raw_dir = "../Saved/SDG/raw"
+dataset_dir = "../Saved/SDG/datasets"
+val_fraction = 0.1
+min_area = 40
+epsilon = 1
+empty_keep = 0.15
+previews = 40
+
+# ---- render: Movie Render Queue settings
+[render]
+resolution = [1280, 720]
+executor = "pie"
+fps = 30
+anti_aliasing = "tsr"
+warmup_frames = 32
+
+# ---- post: the dataset builder, and what happens after a full render
+[post]
+python = ""
+workers = 6
+train = "seg"
+train_args = "--epochs 150"
+open_trainer = true
+
+# ---- classes: YOLO ids follow list order: append new classes at the END
+[classes]
+seg = ["bin_o", "bin_x"]
+pose = ["bin"]
+
+# ---- props: which objects in the level get labels
+[[props]]
+name = "bin_o"
+type = "material_slots"
+static_mesh = "/Game/Props/SM_Bin_O*"
+slots = { "*Yellow*" = "bin_o" }
+pose_class = "bin"
+keypoints = "top4"
+
+[[props]]
+name = "bin_x"
+type = "material_slots"
+static_mesh = "/Game/Props/SM_Bin_X*"
+slots = { "*Yellow*" = "bin_x" }
+pose_class = "bin"
+keypoints = "top4"
+
+# ---- camera: where the camera may be and how it frames the props
+[camera]
+fov = [52, 60]
+distance = [100, 600]
+elevation = [25, 85]
+aim_jitter = 10
+roll = [-8, 8]
+speed = [6, 25]
+turn = 30
+switch_target = 0.35
+volume = { min = [2481, 2480, 433], max = [-2470, -2446, 66] }
+
+# ---- randomize: one block per randomized variable
+[[randomize]]
+name = "sun_intensity"
+actor = "*"
+component = "DirectionalLightComponent"
+property = "Intensity"
+mode = "multiply"
+value = [0.15, 2.0]
+every = 15
+smooth = true
+
+[[randomize]]
+name = "sun_direction"
+actor = "*"
+component = "DirectionalLightComponent"
+type = "transform"
+rotation = { pitch = [-20, 20], yaw = [-180, 180] }
+every = 15
+smooth = true
+
+[[randomize]]
+name = "sun_color"
+actor = "*"
+component = "DirectionalLightComponent"
+property = "LightColor"
+type = "color"
+value = { hsv = { h = [0, 1], s = [0, 0.3], v = [1, 1] } }
+every = 15
+smooth = true
+
+[[randomize]]
+name = "caustics_scale"
+actor = "*"
+component = "DirectionalLightComponent"
+property = "LightFunctionScale"
+type = "vector"
+mode = "multiply"
+value = [0.5, 2.0]
+every = 15
+smooth = true
+
+[[randomize]]
+name = "sky_intensity"
+actor = "*"
+component = "SkyLightComponent"
+property = "Intensity"
+mode = "multiply"
+value = [0.3, 1.8]
+every = 15
+smooth = true
+
+[[randomize]]
+name = "exposure"
+postprocess = "AutoExposureBias"
+value = [-1.5, 1.2]
+
+[[randomize]]
+name = "white_balance"
+postprocess = "WhiteTemp"
+value = [4500, 9000]
+
+[[randomize]]
+name = "film_grain"
+postprocess = "FilmGrainIntensity"
+value = [0, 0.4]
+
+[[randomize]]
+name = "chromatic_aberration"
+postprocess = "SceneFringeIntensity"
+value = [0, 2]
+
+[[randomize]]
+name = "vignette"
+postprocess = "VignetteIntensity"
+value = [0, 0.7]
+
+[[randomize]]
+name = "bloom"
+postprocess = "BloomIntensity"
+value = [0, 0.8]
+
+[[randomize]]
+name = "bins_layout"
+actor = "SM_Bin_*"
+type = "transform"
+per_target = true
+location = { x = [-100, 100] }
+rotation = { yaw = [-180, 180] }
+every = 25
+
+# ---- water_fog: extra underwater haze (M_SDG_WaterFog)
+[water_fog]
+enabled = true
+density = [0.0001, 0.0012]
+color = { hsv = { h = [0.38, 0.6], s = [0.3, 0.8], v = [0.02, 0.15] } }
+min_visibility = 0.15
+every = 1
+smooth = true
+
+# ---- stages: batches rendered back to back into one dataset
+[[stages]]
+name = "overhead"
+frames = 1500
+camera = { mode = "random_path", distance = [100, 300], elevation = [50, 85], speed = [4, 15] }
+
+[[stages]]
+name = "snap"
+frames = 5000
+camera = { mode = "teleport", hold = 2, distance = [100, 450] }
+override = { bins_layout = { every = 1 } }
+
+[[stages]]
+name = "far_dim"
+frames = 2000
+camera = { mode = "random_path", distance = [300, 600], elevation = [25, 60], speed = [10, 30] }
+override = { sun_intensity = { value = [0.1, 0.7], every = 15, smooth = true }, exposure = [-1.5, 0.5] }

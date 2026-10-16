@@ -9,6 +9,8 @@ import copy
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,7 +27,9 @@ ROOT = os.path.dirname(APP)
 REAL_CONFIGS = os.path.join(ROOT, "sdg", "configs")
 TMP = tempfile.mkdtemp(prefix="sdg_app_test_")
 os.environ.update(SDG_APP_CONFIGS=os.path.join(TMP, "configs"), SDG_BRIDGE_DIR=os.path.join(TMP, "bridge"),
-                  SDG_APP_STATE=os.path.join(TMP, "state"), SDG_APP_HIDDEN="1")
+                  SDG_APP_STATE=os.path.join(TMP, "state"), SDG_APP_HIDDEN="1", SDG_RUNS_DIR=os.path.join(TMP, "sdg_runs"),
+                  SDG_PYTHON=sys.executable, SDG_TRAIN_SCRIPT=os.path.join(TMP, "fake_train_yolo.py"),
+                  SDG_EVAL_SCRIPT=os.path.join(TMP, "fake_eval_real.py"))
 os.makedirs(os.environ["SDG_APP_CONFIGS"])
 sys.path[:0] = [APP, os.path.join(ROOT, "sdg")]
 
@@ -301,6 +305,7 @@ def test_training_launch():
     ds = os.path.join(server.load_cfg("apptest")["output"]["dataset_dir"], "demo_v1")
     opts = server.train_options(settings)
     assert opts["repo_ok"] and opts["python_ok"] and set(opts["presets"]) == {"off", "light", "medium", "strong"}
+    assert opts["defaults"]["workers"] == 12
     req = {"dataset": ds, "model_name": "demo_s", "version": "yolo11", "size": "s", "epochs": 3, "imgsz": 320,
            "batch": 4, "aug": opts["presets"]["strong"]["values"], "albumentations": "underwater", "cache": "off"}
     r = server.start_training(req, settings)
@@ -309,6 +314,7 @@ def test_training_launch():
     with open(r["config"], encoding="utf-8") as f:
         written = yaml.safe_load(f)
     assert written["augment"]["albumentations"] == "underwater" and written["train"]["cache"] is False
+    assert written["train"]["workers"] == 12
     assert written["model"] == {"version": "yolo11", "size": "s", "task": "auto", "base_weights": None, "weights_dir": "weights"}
     entry = server.registry()[-1]
     for _ in range(300):
@@ -323,11 +329,124 @@ def test_training_launch():
     d = server.run_detail(settings, "demo_s")
     assert len(d["rows"]) == 3 and "metrics/mAP50-95(M)" in d["columns"]
     assert server.start_training(req, settings).get("exists")          # model file there: ask first
-    r = server.launch_tool(settings, {"tool": "analyse", "run": "demo_s"})
-    assert r["ok"] and "analyse_model.py" in r["command"]
+    r = server.launch_tool(settings, {"tool": "analyse", "run": "app:demo_s"})
+    assert r["ok"] and "analyse_model.py" in r["command"] and "--out" in r["command"]
+    assert runs["demo_s"]["id"] == "app:demo_s" and runs["demo_s"]["source"] == "yolo-training"
     for badreq in ({**req, "model_name": "bad name"}, {**req, "version": "yolo99"}, {**req, "epochs": 0},
                    {**req, "albumentations": "sepia"}, {**req, "dataset": os.path.join(TMP, "nope")}):
         expect_api_error(server.start_training, {**badreq, "overwrite": True}, settings)
+
+
+FAKE_SDG_TRAIN = r'''
+import argparse, json, os
+import cv2, numpy as np
+ap = argparse.ArgumentParser()
+for k in ("--task", "--data", "--name", "--project", "--model", "--workers"):
+    ap.add_argument(k)
+ap.add_argument("--quick", action="store_true")
+ap.add_argument("--eval", nargs="*", default=[])
+ap.add_argument("--unstretch", nargs="+")
+a = ap.parse_args()
+assert a.quick and os.path.isfile(a.data) and a.task == "seg" and a.workers == "12"
+run = os.path.join(a.project, a.name)
+os.makedirs(os.path.join(run, "weights"))
+with open(os.path.join(run, "args.yaml"), "w") as f:
+    f.write("task: segment\nepochs: 3\nimgsz: 640\n")
+with open(os.path.join(run, "results.csv"), "w") as f:
+    f.write("epoch,time,train/box_loss,metrics/mAP50(B),metrics/mAP50-95(B),metrics/mAP50(M),metrics/mAP50-95(M),val/box_loss\n")
+    for e in (1, 2, 3):
+        f.write(f"{e},{5.0 * e},{1.0 / e},0.9,0.8,0.9,{0.6 + 0.01 * e},{1.2 / e}\n")
+open(os.path.join(run, "weights", "best.pt"), "wb").close()
+for d in a.eval:
+    name = os.path.basename(os.path.dirname(d))
+    out = os.path.join(run, "real_eval", name)
+    os.makedirs(os.path.join(out, "overlays"))
+    cv2.imwrite(os.path.join(out, "overlays", "valid_a.jpg"), np.zeros((9, 16, 3), np.uint8))
+    json.dump({"name": name, "data": d, "images": 5, "instances": 7, "splits": ["valid"], "unstretch": a.unstretch,
+               "false_detections_conf50": 2, "all": {"P": 0.8, "R": 0.95, "mAP50": 0.9, "mAP50-95": 0.7},
+               "per_class": {"blood": {"instances": 7, "P": 0.8, "R": 0.95, "AP50": 0.9, "AP50-95": 0.7}}},
+              open(os.path.join(out, "metrics.json"), "w"))
+'''
+
+FAKE_EVAL = r'''
+import argparse, json, os
+ap = argparse.ArgumentParser()
+ap.add_argument("--model"); ap.add_argument("--out")
+ap.add_argument("--data", nargs="+"); ap.add_argument("--splits", nargs="+"); ap.add_argument("--unstretch", nargs="+")
+a = ap.parse_args()
+assert os.path.isfile(a.model)
+for d in a.data:
+    out = os.path.join(a.out, "again")
+    os.makedirs(out, exist_ok=True)
+    json.dump({"all": {"P": 0.5, "R": 0.5, "mAP50": 0.5, "mAP50-95": 0.4}, "data": d, "images": 1,
+               "per_class": {"fire": {"instances": 3, "P": 0.5, "R": 0.5, "AP50": 0.5, "AP50-95": 0.4}}},
+              open(os.path.join(out, "metrics.json"), "w"))
+'''
+
+
+def _wait_exit(status_file):
+    st = ""
+    for _ in range(300):
+        st = server._read_text(status_file) or ""
+        if st.startswith("exit"):
+            break
+        time.sleep(0.1)
+    return st.strip()
+
+
+def test_quick_train():
+    write(os.path.join(TMP, "fake_train_yolo.py"), FAKE_SDG_TRAIN)
+    write(os.path.join(TMP, "fake_eval_real.py"), FAKE_EVAL)
+    real = os.path.join(TMP, "real", "Torpedo_RS.v1", "data.yaml")
+    write(real, "names: [ambulance, blood, fire, firetruck, flex, hole]\n")
+    settings = server.Settings()
+    settings.update(real_sets=real + "\n" + os.path.join(TMP, "gone.zip"), real_unstretch="1280 720")
+    assert settings.get("real_sets") == [real.replace("\\", "/"), os.path.join(TMP, "gone.zip").replace("\\", "/")]
+    opts = server.train_options(settings)
+    assert opts["sdg_python_ok"] and [x["label"] for x in opts["real_sets"]] == ["Torpedo_RS.v1"], opts["real_sets"]
+    assert opts["quick"]["epochs"] == 30 and opts["defaults"]["workers"] == 12
+    ds_dir = server.load_cfg("apptest")["output"]["dataset_dir"]
+    ds = os.path.join(ds_dir, "demo_v1")
+    r = server.start_quick({"dataset": os.path.join(ds_dir, "demo_v1_yolo_seg.zip")}, settings)   # the zip -> its folder
+    assert r["ok"] and r["id"] == "sdg:demo_v1_quick" and r["real_sets"] == 1, r
+    assert "--quick" in r["command"] and "--eval" in r["command"] and "--unstretch 1280 720" in r["command"], r["command"]
+    assert _wait_exit(server.registry()[-1]["status_file"]) == "exit 0"
+    runs = {x["id"]: x for x in server.list_runs(settings)}
+    q = runs["sdg:demo_v1_quick"]
+    assert q["status"] == "finished" and q["quick"] and q["source"] == "pipeline" and q["epoch"] == 3, q
+    assert q["real"] == [{"name": "Torpedo_RS.v1", "mAP50": 0.9}], q["real"]
+    d = server.run_detail(settings, "sdg:demo_v1_quick")
+    rr = d["real_eval"][0]
+    assert rr["all"]["mAP50"] == 0.9 and rr["false50"] == 2 and rr["overlays"] == ["real_eval/Torpedo_RS.v1/overlays/valid_a.jpg"]
+    assert os.path.isfile(server.run_file(settings, "sdg:demo_v1_quick", rr["overlays"][0]))
+    expect_api_error(server.run_file, settings, "sdg:demo_v1_quick", "../../../state/settings.json")
+    expect_api_error(server.run_file, settings, "sdg:demo_v1_quick", "args.yaml")
+    assert server.start_quick({"dataset": ds}, settings)["name"] == "demo_v1_quick_2"           # never overwrites a run
+    assert _wait_exit(server.registry()[-1]["status_file"]) == "exit 0"
+    # Evaluate: real datasets from the request, stored for next time; results show up next to the old ones
+    r = server.launch_tool(settings, {"tool": "evaluate", "run": "sdg:demo_v1_quick", "data": [real], "unstretch": ""})
+    assert "--unstretch none" in r["command"] and settings.get("real_unstretch") == "" and settings.get("real_sets") == [real.replace("\\", "/")]
+    for _ in range(100):
+        if len(server.run_detail(settings, "sdg:demo_v1_quick")["real_eval"]) == 2:
+            break
+        time.sleep(0.1)
+    d = server.run_detail(settings, "sdg:demo_v1_quick")
+    by = {x["name"]: x for x in d["real_eval"]}
+    assert sorted(by) == ["Torpedo_RS.v1", "again"] and by["again"]["instances"] == 3, by
+    # a run started by post.py (no registry entry) with results from an earlier eval layout
+    old = os.path.join(os.environ["SDG_RUNS_DIR"], "torpedo_v1_seg")
+    write(os.path.join(old, "args.yaml"), "task: segment\nepochs: 150\n")
+    write(os.path.join(old, "results.csv"), "epoch,time,metrics/mAP50-95(M)\n1,700,0.75\n2,1400,0.76\n")
+    write(os.path.join(old, "eval_real", "tropedo", "metrics.json"),
+          json.dumps({"all": {"P": 0.9, "R": 0.99, "mAP50": 0.972, "mAP50-95": 0.78}, "images": 228, "per_class": {}}))
+    os.utime(os.path.join(old, "results.csv"), (time.time() - 90000, time.time() - 90000))
+    runs = {x["id"]: x for x in server.list_runs(settings)}
+    assert runs["sdg:torpedo_v1_seg"]["status"] == "ended" and runs["sdg:torpedo_v1_seg"]["real"][0]["name"] == "tropedo"
+    assert server.run_detail(settings, "torpedo_v1_seg")["id"] == "sdg:torpedo_v1_seg"          # bare names still work
+    for bad in ({"dataset": ""}, {"dataset": os.path.join(TMP, "nope")}, {"dataset": ds, "model_name": "bad name"},
+                {"dataset": ds, "version": "yolo99"}):
+        expect_api_error(server.start_quick, bad, settings)
+    expect_api_error(server.run_detail, settings, "sdg:nope")
 
 
 # ---------------------------------------------------------------------------- http
@@ -366,11 +485,120 @@ def test_http():
         assert res["ok"], res
         res = json.loads(call("/api/toml/parse", {"text": "{ normal = [1, 0.2], clip = [0, 2] }"})[1])
         assert res["ok"] and res["value"] == {"normal": [1, 0.2], "clip": [0, 2]}
+        assert call("/files/run?id=sdg:demo_v1_quick&f=../../state/settings.json")[0] == 404
+        code, body = call("/files/run?id=sdg:demo_v1_quick&f=real_eval/Torpedo_RS.v1/overlays/valid_a.jpg")
+        assert code == 200 and body[:2] == b"\xff\xd8"
+        runs = json.loads(call("/api/train/runs")[1])
+        assert any(r["id"] == "sdg:demo_v1_quick" for r in runs)
+        code, body = call("/api/train/quick", {"dataset": ""})
+        assert code == 400 and b"choose a dataset" in body
         code, body = call("/files/preview?config=apptest&f=s_000000.jpg")
         assert code == 200 and body[:2] == b"\xff\xd8"
         assert call("/files/preview?config=apptest&f=../../run.json")[0] == 404
     finally:
         srv.shutdown()
+
+
+# ---------------------------------------------------------------------------- settings from an older app
+def test_settings_migration():
+    path = os.path.join(os.environ["SDG_APP_STATE"], "settings.json")
+    keep = open(path, encoding="utf-8").read() if os.path.isfile(path) else None
+    try:
+        real = os.path.join(TMP, "real_old", "data.yaml").replace("\\", "/")
+        write(real, "names: [a]\n")
+        write(path, json.dumps({"real_data": real}))           # an older app saved only real_data
+        s = server.Settings()
+        assert s.data["real_sets"][-1] == real and s.data["real_sets"][:-1] == server.sc.default_real_sets()
+        write(path, json.dumps({"real_data": real, "real_sets": []}))   # a saved list (even empty) wins
+        assert server.Settings().data["real_sets"] == []
+        assert server.sc.merge_real_sets(["a/b.zip", "c"], "a/b.zip") == ["a/b.zip", "c"]
+        assert server.sc.merge_real_sets([], None) == []
+    finally:
+        if keep is None:
+            os.remove(path)
+        else:
+            write(path, keep)
+
+
+# ---------------------------------------------------------------------------- server updates
+OLD_APP = r"""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _reply(self, code, body=b"{}"):
+        self.send_response(code); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/api/ping": return self._reply(200, json.dumps({"app": "sdg", "pid": os.getpid()}).encode())
+        self._reply(404)
+    def do_POST(self): self._reply(404)
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+"""
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _until(cond, seconds=20):
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        v = cond()
+        if v:
+            return v
+        time.sleep(0.2)
+    raise AssertionError("timed out")
+
+
+def test_server_version():
+    info = server.server_info()
+    assert info["version"] == server.BOOT_VERSION and not info["stale"]
+    extra = os.path.join(TMP, "extra_code.py")
+    write(extra, "x = 1\n")
+    server.CODE_FILES.append(extra)                    # "the code on disk changed since the server started"
+    try:
+        assert server.server_info()["stale"]
+    finally:
+        server.CODE_FILES.remove(extra)
+    assert not server.server_info()["stale"]
+
+
+def test_replace_running_server():
+    port = _free_port()
+    script = os.path.join(APP, "server.py")
+    ping = lambda: server._ping(port, timeout=1)                             # noqa: E731
+    old = subprocess.Popen([sys.executable, "-c", OLD_APP, str(port)])      # an app from before versions existed
+    new_pid = None
+    try:
+        _until(ping)
+        a = subprocess.Popen([sys.executable, script, "--no-browser", "--port", str(port)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        info = _until(lambda: (p := ping()) and p.get("version") == server.BOOT_VERSION and p)
+        assert info["pid"] == a.pid
+        old.wait(10)                                                        # ended by its pid
+        # the same code started again: it only opens a window (none here) and exits
+        r = subprocess.run([sys.executable, script, "--no-browser", "--port", str(port)],
+                           capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0 and "already running" in r.stdout, r.stdout + r.stderr
+        assert ping()["pid"] == a.pid
+        # the Restart button: a new copy takes over, the running one quits by itself
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/restart", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            assert json.load(res)["pid"] == a.pid
+        new_pid = _until(lambda: (p := ping()) and p["pid"] != a.pid and p["pid"])
+        assert a.wait(15) == 0, a.stdout.read()
+        assert "took over" in a.stdout.read()
+    finally:
+        for p in (old,):
+            if p.poll() is None:
+                p.kill()
+        if new_pid:
+            os.kill(new_pid, 15)
+        elif "a" in locals() and a.poll() is None:
+            a.kill()
 
 
 def main():

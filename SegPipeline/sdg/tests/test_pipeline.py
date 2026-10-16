@@ -226,6 +226,110 @@ def test_config():
         os.remove(bad)
 
 
+def test_prop_images():
+    tc = sc.load_config("torpedo")
+    imgs = sc.prop_images(tc["props"][0], tc["seg_classes"])
+    assert len(imgs) == 3 and imgs[0]["image"] is None and imgs[1]["image"].endswith("task4_ver1/texture.png")
+    assert all(set(i["regions"]) == {"ambulance", "blood", "fire", "firetruck"} for i in imgs)
+    assert all(os.path.isfile(p) for i in imgs for p in list(i["regions"].values()) + [i["image"] or __file__])
+    snap = next(st for st in tc["stages"] if st["name"] == "snap")
+    rz = next(r for r in sc.stage_randomizers(tc, snap) if r["name"] == "board_image")
+    assert sc.randomizer_type(rz) == "image" and rz["every"] == 1 and rz["value"]["choice"] == [0, 1, 2]
+
+    base = ('name = "x"\nmap = "/Game/m"\n[classes]\nseg = ["ambulance", "blood", "fire", "firetruck"]\n'
+            '[[props]]\nname = "board"\ntype = "texture_regions"\ntexture = "/Game/T"\n'
+            'regions = { blood = "props/torpedo_board/T_Mask_blood.png" }\n{images}'
+            '[[randomize]]\nname = "img"\ntype = "image"\nprop = "board"\n{value}'
+            '[[stages]]\nname = "a"\nframes = 1\n{override}')
+    one = 'images = ["props/torpedo_board/images/task4_ver1/texture.png"]\n'
+    cases = [
+        (dict(images=one, value="", override=""), None),
+        (dict(images="", value="", override=""), "has images"),
+        (dict(images=one, value="value = { choice = [0, 2] }\n", override=""), "image numbers 0..1"),
+        (dict(images=one, value="value = [0, 1]\n", override=""), "image numbers"),
+        (dict(images=one, value="", override='override = { img = { choice = [3] } }\n'), "override img"),
+        (dict(images='images = ["requirements.txt"]\n', value="", override=""), "no T_Mask_<class>.png"),
+        (dict(images='images = ["props/torpedo_board/nope.png"]\n', value="", override=""), "image not found"),
+        (dict(images='images = ["props/torpedo_board/images/task4_ver1/texture.png", '
+                     '"props/torpedo_board/images/task4_ver1/T_Mask_fire.png"]\n', value="", override=""), "own folder"),
+    ]
+    bad = os.path.join(HERE, "_bad.toml")
+    try:
+        for fields, want in cases:
+            with open(bad, "w") as f:
+                f.write(base.replace("{images}", fields["images"]).replace("{value}", fields["value"])
+                        .replace("{override}", fields["override"]))
+            try:
+                cfg = sc.load_config(bad)
+                assert want is None, f"not caught: {want}"
+                assert cfg["randomize"][0]["value"] == {"choice": [0, 1]}          # default: every image
+            except sc.ConfigError as e:
+                assert want is not None and want in str(e), (want, e)
+    finally:
+        os.remove(bad)
+
+
+def test_training_commands(tmp):
+    """post.train = quick / seg / both -> train_yolo.py commands; seg runs are scored on the app's real datasets."""
+    real = os.path.join(tmp, "Torpedo_RS", "data.yaml")
+    os.makedirs(os.path.dirname(real))
+    open(real, "w").write("names: [a]\n")
+    state = os.path.join(tmp, "appstate")
+    os.makedirs(state)
+    with open(os.path.join(state, "settings.json"), "w") as f:
+        json.dump({"real_sets": [real, os.path.join(tmp, "missing.zip")], "real_unstretch": "1280 720"}, f)
+    old = os.environ.get("SDG_APP_STATE")
+    os.environ["SDG_APP_STATE"] = state
+    try:
+        assert sc.real_sets() == [real] and sc.real_unstretch() == "1280 720"
+        run = {"dataset": "D", "name": "torpedo_v1", "pose_classes": ["board"], "post": {"train_args": "--epochs 150"}}
+        (q,) = post.training_commands(run, "quick")
+        assert q[q.index("--name") + 1] == "torpedo_v1_seg_quick" and "--quick" in q and "--epochs" not in q
+        assert q[q.index("--eval") + 1:] == [real, "--unstretch", "1280", "720"], q
+        seg, pose = post.training_commands(run, "both")
+        assert "--epochs" in seg and "--eval" in seg and "--eval" not in pose and pose[pose.index("--task") + 1] == "pose"
+        (s,) = post.training_commands(run, "seg", real=[], unstretch="")
+        assert "--eval" not in s
+    finally:
+        if old is None:
+            del os.environ["SDG_APP_STATE"]
+        else:
+            os.environ["SDG_APP_STATE"] = old
+    bad = os.path.join(HERE, "_bad.toml")
+    with open(bad, "w") as f:
+        f.write('name = "x"\nmap = "/Game/m"\n[post]\ntrain = "fast"\n[[stages]]\nname = "a"\nframes = 1\n')
+    try:
+        sc.load_config(bad)
+        raise AssertionError("bad post.train accepted")
+    except sc.ConfigError as e:
+        assert "post.train" in str(e), e
+    finally:
+        os.remove(bad)
+
+
+def test_prop_image_tool(tmp):
+    """tools/prop_image.py makes the same masks as make_texture_masks.ps1 did for the board texture."""
+    sys.path.insert(0, os.path.join(sc.ROOT, "tools"))
+    import prop_image
+    board = os.path.join(sc.ROOT, "props", "torpedo_board")
+    out = os.path.join(tmp, "masks")
+    prop_image.main([os.path.join(board, "board_texture.png"), "--out", out, "--masks-only",
+                     "--classes", "blood,ambulance,fire,firetruck"])
+    for cls in ("blood", "ambulance", "fire", "firetruck"):
+        a = cv2.imread(os.path.join(board, f"T_Mask_{cls}.png"), cv2.IMREAD_GRAYSCALE)
+        b = cv2.imread(os.path.join(out, f"T_Mask_{cls}.png"), cv2.IMREAD_GRAYSCALE)
+        assert a.shape == b.shape and np.array_equal(a > 127, b > 127), cls
+    # holes: the board texture's own holes, cut into a copy without them, land in the same place
+    img = prop_image.read_rgba(os.path.join(board, "board_texture.png"))
+    solid = img.copy()
+    solid[..., 3] = 255
+    solid[img[..., 3] < 255, :3] = (255, 255, 255)
+    solid[prop_image.pure_red(img) & (img[..., 3] < 255)] = (0, 0, 255, 255)
+    assert prop_image.cut_holes(solid, prop_image.hole_sizes(img)) == 4
+    diff = (solid[..., 3] < 128) != (img[..., 3] < 128)
+    assert diff.sum() < 0.03 * (img[..., 3] < 128).sum(), diff.sum()
+
+
 def test_zip(tmp):
     import zipfile
     ds = os.path.join(tmp, "zipds", "demo_v1")

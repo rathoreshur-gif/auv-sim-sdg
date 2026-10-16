@@ -1,84 +1,68 @@
-# Torpedo board: segmentation of the 4 drawings (blood, ambulance, fire, firetruck) on the board (4 panel actors),
-# seen from the front half, 0.5-8 m, wide lighting/water variation, bins hidden, board fixed. ~4000 images.
-#
-# Uses the same setup as pool.toml (no need to re-run setup when switching between the two).
-# In the UE Output Log (Cmd), with /Game/volume/water_volume open:
-#
-#   py "<project>/SegPipeline/sdg/sdg.py" preview torpedo approach   (scrub the camera path)
-#   py "<project>/SegPipeline/sdg/sdg.py" render torpedo --quick 20
-#   py "<project>/SegPipeline/sdg/sdg.py" render torpedo
-#
-# Output: Saved/SDG/datasets/torpedo_v1/seg.yaml  (look at previews/ first)
+# SDG dataset recipe - written by the SDG app (SegPipeline/app).
 
 name = "torpedo_v1"
 map = "/Game/volume/water_volume"
-seed = 1                                # change it for a different dataset from the same recipe
+seed = 1
 
+# ---- output: where the dataset goes and what gets a label
 [output]
 raw_dir = "../Saved/SDG/raw"
 dataset_dir = "../Saved/SDG/datasets"
 val_fraction = 0.1
-min_area = 40                           # px: drawings smaller than this get no label (a drawing ~8 m away is ~500 px)
-epsilon = 1.0
-empty_keep = 0.15                       # share of frames without any drawing kept as background images
+min_area = 40
+epsilon = 1
+empty_keep = 0.15
 previews = 40
 
+# ---- render: Movie Render Queue settings
 [render]
-resolution = [1280, 720]                # OAK-D colour camera, 16:9 output. Use [960, 540] for ~1.8x speed.
+resolution = [1280, 720]
 executor = "pie"
 fps = 30
 anti_aliasing = "tsr"
 warmup_frames = 32
 
+# ---- post: the dataset builder, and what happens after a full render
 [post]
-python = ""                             # "" = $SDG_PYTHON, else SegPipeline/.venv, else ~/seg-train/.venv
+python = ""
 workers = 6
-train = ""                              # off: a full run packs datasets/torpedo_v1_yolo_seg.zip to share instead
-                                        # ("seg" = train right after the render, no zip)
+train = "seg"
 train_args = "--epochs 150"
-open_trainer = true                     # when a full render is done, the SDG app opens its Train page with this dataset
+open_trainer = true
 
-# ------------------------------------------------------------------------------------------ classes
+# ---- classes: YOLO ids follow list order: append new classes at the END
 [classes]
-seg = ["ambulance", "blood", "fire", "firetruck"]   # same ids as the real Torpedo_RS Roboflow set
-pose = []                               # segmentation only
+seg = ["ambulance", "blood", "fire", "firetruck"]
+pose = []
 
+# ---- props: which objects in the level get labels
 [[props]]
 name = "torpedo_board"
 type = "texture_regions"
 texture = "/Game/base_link/Textures/f9f56d69-75f4-4541-ab38-9738eeac5871"
 regions = { blood = "props/torpedo_board/T_Mask_blood.png", ambulance = "props/torpedo_board/T_Mask_ambulance.png", fire = "props/torpedo_board/T_Mask_fire.png", firetruck = "props/torpedo_board/T_Mask_firetruck.png" }
-# The bins are not listed: they render but never get labels (and are hidden below anyway).
+images = ["props/torpedo_board/images/task4_ver1/texture.png", "props/torpedo_board/images/task4_ver2/texture.png"]
 
-# ------------------------------------------------------------------------------------------ camera
+# ---- camera: where the camera may be and how it frames the props
 [camera]
-# OAK-D colour camera: ~69 deg horizontal in air. Behind a flat underwater port refraction narrows it
-# to ~52-55 deg, and Unreal does not simulate refraction, so render with the in-water FOV.
-# (Dome port or OAK-D W / Pro W: tell me and this changes.)
 fov = [52, 60]
-distance = [50, 800]                    # cm; each stage narrows this
-elevation = [-8, 15]                    # deg above (+) / below (-) the board centre
-azimuth = [-50, 50]                     # deg left/right of straight in front: a 100 deg region
-facing = "auto"                         # which side is the front: "auto" = the side face4 uses. If the previews
-                                        # (or `preview`) show the BACK of the boards, change this to "-auto".
-aim_jitter = 10                         # deg the board may sit off-centre (partly out of frame when close)
+distance = [50, 800]
+elevation = [-8, 15]
+azimuth = [-50, 50]
+facing = "auto"
+aim_jitter = 10
 roll = [-8, 8]
-speed = [6, 25]                         # random_path: cm per frame
-turn = 30                               # random_path: deg the view angle may change between waypoints
-switch_target = 0.35                    # random_path: chance to fly on to another board at each waypoint
-# From pool.toml (corners may be in any order). Keeps the camera inside the pool and under the surface;
-# if the log says viewpoints "could not be placed inside camera.volume", re-measure with `sdg.py where`.
+speed = [6, 25]
+turn = 30
+switch_target = 0.35
 volume = { min = [2481, 2480, 433], max = [-2470, -2446, 66] }
 
-# ------------------------------------------------------------------------------------------ randomization
-# Lighting changes every 15 images and blends between values in the flying stages: Lumen and TSR carry
-# lighting over from earlier frames, so a jump on every frame would leave ghosts of the previous light.
-
+# ---- randomize: one block per randomized variable
 [[randomize]]
 name = "hide_bins"
 actor = "SM_Bin_*"
 type = "visible"
-probability = 0.0                       # never visible (their label copies hide with them)
+probability = 0
 
 [[randomize]]
 name = "sun_intensity"
@@ -86,12 +70,12 @@ actor = "*"
 component = "DirectionalLightComponent"
 property = "Intensity"
 mode = "multiply"
-value = [0.15, 2.0]
+value = [0.15, 2]
 every = 15
 smooth = true
 
 [[randomize]]
-name = "sun_direction"                  # moves where the caustics fall
+name = "sun_direction"
 actor = "*"
 component = "DirectionalLightComponent"
 type = "transform"
@@ -105,18 +89,18 @@ actor = "*"
 component = "DirectionalLightComponent"
 property = "LightColor"
 type = "color"
-value = { hsv = { h = [0.0, 1.0], s = [0.0, 0.3], v = [1.0, 1.0] } }
+value = { hsv = { h = [0, 1], s = [0, 0.3], v = [1, 1] } }
 every = 15
 smooth = true
 
 [[randomize]]
-name = "caustics_scale"                 # size of the caustic pattern
+name = "caustics_scale"
 actor = "*"
 component = "DirectionalLightComponent"
 property = "LightFunctionScale"
 type = "vector"
 mode = "multiply"
-value = [0.5, 2.0]
+value = [0.5, 2]
 every = 15
 smooth = true
 
@@ -130,7 +114,6 @@ value = [0.3, 1.8]
 every = 15
 smooth = true
 
-# Camera / image effects: no history, so these change on every image.
 [[randomize]]
 name = "exposure"
 postprocess = "AutoExposureBias"
@@ -144,44 +127,53 @@ value = [4500, 9000]
 [[randomize]]
 name = "film_grain"
 postprocess = "FilmGrainIntensity"
-value = [0.0, 0.4]
+value = [0, 0.4]
 
 [[randomize]]
 name = "chromatic_aberration"
 postprocess = "SceneFringeIntensity"
-value = [0.0, 2.0]
+value = [0, 2]
 
 [[randomize]]
 name = "vignette"
 postprocess = "VignetteIntensity"
-value = [0.0, 0.7]
+value = [0, 0.7]
 
 [[randomize]]
 name = "bloom"
 postprocess = "BloomIntensity"
-value = [0.0, 0.8]
+value = [0, 0.8]
 
-[water_fog]                             # underwater haze: clear to murky, blue-green casts
+[[randomize]]
+name = "board_image"
+type = "image"
+prop = "torpedo_board"
+value = { choice = [0, 1, 2], weights = [1, 2, 1] }
+every = 60
+
+# ---- water_fog: extra underwater haze (M_SDG_WaterFog)
+[water_fog]
 enabled = true
-density = [0.0001, 0.0012]              # 1/cm: at the max, ~38% of the board's light survives 8 m
-color = { hsv = { h = [0.38, 0.6], s = [0.3, 0.8], v = [0.02, 0.15] } }   # darker haze: less milky
-min_visibility = 0.15                   # boards dimmed below 15% by the haze get no label
+density = [0.0001, 0.0012]
+color = { hsv = { h = [0.38, 0.6], s = [0.3, 0.8], v = [0.02, 0.15] } }
+min_visibility = 0.15
 every = 1
 smooth = true
 
-# ------------------------------------------------------------------------------------------ stages
+# ---- stages: batches rendered back to back into one dataset
 [[stages]]
-name = "approach"                       # close: smooth flight 0.5-3 m in front of the boards
-frames = 3000
+name = "approach"
+frames = 1000
 camera = { mode = "random_path", distance = [50, 300], speed = [4, 15] }
 
 [[stages]]
-name = "snap"                           # independent views 0.6-5 m; each pose rendered twice, 2nd kept
-frames = 4000
+name = "snap"
+frames = 7000
 camera = { mode = "teleport", hold = 2, distance = [60, 500] }
+override = { board_image = { every = 1 } }
 
 [[stages]]
-name = "far_dim"                        # 3-8 m, darker light
+name = "far_dim"
 frames = 3000
 camera = { mode = "random_path", distance = [300, 600], speed = [10, 30] }
 override = { sun_intensity = { value = [0.1, 0.7], every = 15, smooth = true }, exposure = [-1.5, 0.5] }

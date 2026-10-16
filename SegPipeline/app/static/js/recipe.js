@@ -220,6 +220,7 @@ function enumValues(hint) {
   const c = S.raw.classes || {};
   if (hint.enum_from === 'classes.seg') return c.seg || [];
   if (hint.enum_from === 'classes.pose') return c.pose || [];
+  if (hint.enum_from === 'props.names') return (S.raw.props || []).filter((p) => p.type === 'texture_regions').map((p) => p.name).filter(Boolean);
   if (hint.enum_from === 'randomize.names') {
     const names = (S.raw.randomize || []).map((r) => r.name).filter(Boolean);
     if (S.raw.water_fog?.enabled) names.unshift('water_fog_density', 'water_fog_color');
@@ -569,7 +570,10 @@ function fogCard() {
 
 // ------------------------------------------------------------------ lists (props, randomize, stages)
 function propSummary(p) {
-  if (p.type === 'texture_regions') return `drawings on a texture: ${Object.keys(p.regions || {}).join(', ') || 'no regions yet'}`;
+  if (p.type === 'texture_regions') {
+    const n = (p.images || []).length;
+    return `drawings on a texture: ${Object.keys(p.regions || {}).join(', ') || 'no regions yet'}${n ? `  ·  ${n + 1} images` : ''}`;
+  }
   if (p.type === 'material_slots') return `material slots: ${Object.entries(p.slots || {}).map(([k, v]) => `${k} → ${v || '?'}`).join(', ')}`;
   if (p.type === 'actor') return `whole actor → ${p.class || '?'}${p.actor_label ? `  (${p.actor_label})` : ''}`;
   return p.type || 'choose a type';
@@ -592,6 +596,7 @@ function valueSummary(v, mode) {
 function rzSummary(rz) {
   const t = rzType(rz);
   const target = rz.postprocess ? `post-process ${rz.postprocess}` : t === 'mpc' ? `material parameter ${rz.param || '?'}`
+    : t === 'image' ? `image on ${rz.prop || '?'}`
     : [rz.actor || (rz.tag && `tag ${rz.tag}`), rz.component, rz.property || rz.param].filter(Boolean).join(' › ');
   let val;
   if (t === 'transform') {
@@ -599,6 +604,8 @@ function rzSummary(rz) {
       .map((k) => `${k} ${Object.entries(rz[k]).map(([a, r]) => `${a} ${fmtRange(r)}`).join(', ')}`).join('; ');
   } else if (t === 'visible') {
     val = `shown ${Math.round((rz.probability ?? 0.5) * 100)}% of the time`;
+  } else if (t === 'image' && rz.value === undefined) {
+    val = 'any of its images';
   } else {
     val = valueSummary(rz.value, rz.mode);
   }
